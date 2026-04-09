@@ -1,0 +1,112 @@
+# File: isaaclab_tasks/direct/dextra_amp/agents/skrl_amp_student_cfg.yaml
+
+seed: 42
+
+# ✅ Teacher checkpoint path
+teacher_checkpoint: "C:\IsaacLab\logs\skrl\dextra_amp_walk\2025-11-22_20-30-06_ppo_torch\checkpoints\best_agent.pt"  # 수정 필요!
+
+# Models
+models:
+  separate: True
+  policy:  # Student policy (31D input)
+    class: GaussianMixin
+    clip_actions: False
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: -2.9
+    fixed_log_std: True
+    network:
+      - name: net
+        input: OBSERVATIONS  # 31D
+        layers: [512, 256]
+        activations: relu
+    output: ACTIONS
+  
+  value:  # Value (31D input)
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: OBSERVATIONS  # 31D
+        layers: [512, 256]
+        activations: relu
+    output: ONE
+  
+  discriminator:  # Discriminator (43D AMP obs)
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: OBSERVATIONS  # 43D
+        layers: [1024, 512, 256]
+        activations: relu
+    output: ONE
+
+# Memories (same)
+memory:
+  class: RandomMemory
+  memory_size: -1
+
+motion_dataset:
+  class: RandomMemory
+  memory_size: 200000
+
+reply_buffer:
+  class: RandomMemory
+  memory_size: 1000000
+
+# Agent
+agent:
+  class: AMP
+  rollouts: 16
+  learning_epochs: 6
+  mini_batches: 2
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 5.0e-05
+  
+  # Distillation weights (추가)
+  distillation_loss_scale: 2.0  # MSE(student_action, teacher_action)
+  kl_loss_scale: 1.0             # KL(student_dist || teacher_dist)
+  
+  # AMP weights (reduced)
+  discriminator_loss_scale: 2.0  # 원래 5.0 → 2.0
+  style_reward_weight: 0.5       # 원래 1.0 → 0.5
+  
+  # 나머지 동일
+  state_preprocessor: RunningStandardScaler
+  value_preprocessor: RunningStandardScaler
+  amp_state_preprocessor: RunningStandardScaler
+  
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 0.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: True
+  
+  entropy_loss_scale: 0.0
+  value_loss_scale: 2.5
+  
+  amp_batch_size: 512
+  task_reward_weight: 0.0
+  discriminator_batch_size: 4096
+  discriminator_reward_scale: 2.0
+  discriminator_logit_regularization_scale: 0.05
+  discriminator_gradient_penalty_scale: 5.0
+  discriminator_weight_decay_scale: 1.0e-04
+  
+  time_limit_bootstrap: False
+  
+  experiment:
+    directory: "dextra_amp_student"
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+
+# Trainer
+trainer:
+  class: SequentialTrainer
+  timesteps: 80000  # 50M steps (teacher 있으니 절반)
+  environment_info: log
