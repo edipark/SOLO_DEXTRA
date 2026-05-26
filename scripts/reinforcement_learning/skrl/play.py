@@ -57,6 +57,30 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--print-base-velocity",
+    action="store_true",
+    default=False,
+    help="Print base link linear velocity (world frame) during play. Works with DirectRLEnv tasks that expose .robot.",
+)
+parser.add_argument(
+    "--print-base-velocity-interval",
+    type=int,
+    default=1,
+    help="Print every N environment steps when --print-base-velocity is set (default: 1).",
+)
+parser.add_argument(
+    "--print-base-velocity-env",
+    type=int,
+    default=0,
+    help="Which sub-environment index to read when num_envs > 1 (default: 0).",
+)
+parser.add_argument(
+    "--print-base-angular",
+    action="store_true",
+    default=False,
+    help="Also print base angular velocity (world frame).",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -114,6 +138,20 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
+
+
+def _unwrap_env_with_robot(env):
+    """Walk wrappers until we find an Isaac env that exposes ``robot`` and ``ref_body_index`` (e.g. DirectRLEnv)."""
+    e = env
+    for _ in range(16):
+        if hasattr(e, "robot") and hasattr(e, "ref_body_index"):
+            return e
+        nu = getattr(e, "unwrapped", None)
+        if nu is None or nu is e:
+            return None
+        e = nu
+    return None
+
 
 # config shortcuts
 if args_cli.agent is None:
@@ -194,6 +232,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+    # Keep a handle to the Isaac env (before skrl) for optional debug reads (e.g. base velocity)
+    env_before_skrl = env
+
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
 
@@ -209,9 +250,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # set agent to evaluation mode
     runner.agent.set_running_mode("eval")
 
+    if args_cli.print_base_velocity:
+        _core = _unwrap_env_with_robot(env_before_skrl)
+        if _core is None:
+            print("[WARN] --print-base-velocity: no env with `.robot` found (DirectRLEnv-style); skipping prints.")
+        else:
+            print(
+                "[INFO] Printing base_link velocity (world frame). "
+                f"env_index={args_cli.print_base_velocity_env}, every {max(1, args_cli.print_base_velocity_interval)} step(s)."
+            )
+
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+    play_step = 0
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -228,6 +280,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
             obs, _, _, _, _ = env.step(actions)
+        play_step += 1
+        if args_cli.print_base_velocity:
+            core = _unwrap_env_with_robot(env_before_skrl)
+            if core is not None:
+                interval = max(1, args_cli.print_base_velocity_interval)
+                if play_step % interval == 0:
+                    n = core.robot.data.body_lin_vel_w.shape[0]
+                    ei = int(min(max(0, args_cli.print_base_velocity_env), n - 1))
+                    v = core.robot.data.body_lin_vel_w[ei, core.ref_body_index]
+                    vx, vy, vz = float(v[0]), float(v[1]), float(v[2])
+                    speed = float((v * v).sum().sqrt())
+                    msg = (
+                        f"[base vel] step={play_step} env{ei} lin_w=({vx:+.4f}, {vy:+.4f}, {vz:+.4f}) m/s "
+                        f"|v|={speed:.4f}"
+                    )
+                    if args_cli.print_base_angular:
+                        w = core.robot.data.body_ang_vel_w[ei, core.ref_body_index]
+                        msg += (
+                            f" | ang_w=({float(w[0]):+.4f}, {float(w[1]):+.4f}, {float(w[2]):+.4f}) rad/s"
+                        )
+                    print(msg, flush=True)
         if args_cli.video:
             timestep += 1
             # exit the play loop after recording one video

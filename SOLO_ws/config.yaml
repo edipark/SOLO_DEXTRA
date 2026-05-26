@@ -1,0 +1,45 @@
+# SOLO Deployment Configuration
+# ================================
+# DEXTRA lower-body robot with 12× Dynamixel AX-18A on Raspberry Pi 5
+
+control:
+  frequency_hz: 30          # Control loop frequency (matches sim decimation=2 @ 120Hz)
+  action_scale: 2.6180      # π/2 — maps [-1,1] action to [-π/2, π/2] rad (same as sim)
+  action_offset: 0.0        # Symmetric joint range → zero offset
+
+dynamixel:
+  port: "/dev/ttyUSB0"      # U2D2 USB adapter
+  baudrate: 1000000          # 1 Mbps (AX-18A max)
+  protocol_version: 1.0
+
+model:
+  window: 50                 # LSTM history window (must match training)
+  teacher_onnx: "models/teacher_policy.onnx"
+  estimator_onnx: "models/lstm_estimator.onnx"
+
+safety:
+  watchdog_warn_ms: 40       # Warn if loop exceeds this
+  watchdog_stop_ms: 200      # Emergency stop if loop exceeds this
+  max_position_rad: 2.6180   # π/2 — absolute position limit (matches sim)
+  startup_hold_sec: 2.0      # Hold default pose before starting policy
+
+velocity_filter:
+  type: "ema"                # Exponential Moving Average for finite-diff velocity
+  alpha: 0.2                 # EMA smoothing factor (0=max smoothing, 1=no filter)
+
+# Joint configuration: order must match simulation
+# AX-18A: 300° range (0-1023), center at 512
+# RAD_PER_UNIT = 5.23599 / 1024 ≈ 0.005115
+joints:
+  - { name: "L_HipYaw_Joint",     servo_id:  1, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "R_HipYaw_Joint",     servo_id:  7, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "L_HipRoll_Joint",    servo_id:  2, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "R_HipRoll_Joint",    servo_id:  8, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "L_Thigh_Joint",      servo_id:  3, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "R_Thigh_Joint",      servo_id:  9, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "L_Calf_Joint",       servo_id:  4, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "R_Calf_Joint",       servo_id: 10, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "L_AnklePitch_Joint", servo_id:  5, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "R_AnklePitch_Joint", servo_id: 11, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "L_AnkleRoll_Joint",  servo_id:  6, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }
+  - { name: "R_AnkleRoll_Joint",  servo_id: 12, offset_raw: 512, lower_rad: -2.6180, upper_rad: 2.6180 }

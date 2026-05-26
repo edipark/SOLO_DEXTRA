@@ -38,6 +38,12 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
+parser.add_argument(
+    "--reset_log_std",
+    type=float,
+    default=None,
+    help="After loading checkpoint, reset policy log_std to this value (e.g. -1.6 to restore initial exploration).",
+)
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
@@ -229,6 +235,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
+
+        # optionally reset log_std after loading (to restore exploration)
+        if args_cli.reset_log_std is not None:
+            import torch
+
+            for model_name in ("policy", "value"):
+                model = getattr(runner.agent, model_name, None)
+                if model is None:
+                    continue
+                for param_name, param in model.named_parameters():
+                    if "log_std" in param_name:
+                        with torch.no_grad():
+                            param.fill_(args_cli.reset_log_std)
+                        print(f"[INFO] Reset {model_name}.{param_name} to {args_cli.reset_log_std:.4f} (std={torch.exp(param[0]).item():.4f})")
 
     # run training
     runner.run()

@@ -43,6 +43,13 @@ docker/.container.cfg
 docker/artifacts/
 *.tmp
 
+# SOLO_DEXTRA / local
+/models/
+/outputs/
+/logs/
+.venv/
+**/.DS_Store
+
 # Doc Outputs
 **/docs/_build/*
 **/generated/*

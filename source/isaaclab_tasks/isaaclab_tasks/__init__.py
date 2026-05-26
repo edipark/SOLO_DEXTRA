@@ -34,6 +34,15 @@ from .utils import import_packages
 
 # The blacklist is used to prevent importing configs from sub-packages
 # TODO(@ashwinvk): Remove pick_place from the blacklist once pinocchio from Isaac Sim is compatibility
-_BLACKLIST_PKGS = ["utils", ".mdp", "pick_place", "direct.humanoid_amp.motions"]
+_BLACKLIST_PKGS = [
+    "utils",
+    ".mdp",
+    "direct.SOLO_DEXTRA.motions",
+    "direct.SOLO_DEXTRA.train_dagger",
+    "direct.SOLO_DEXTRA.play_dagger",
+    "direct.SOLO_DEXTRA.solo_ablation",
+    "direct.SOLO_DEXTRA.run_ablation",
+    "direct.SOLO_DEXTRA.replay_motion",
+]
 # Import all configs in this package
 import_packages(__name__, _BLACKLIST_PKGS)
