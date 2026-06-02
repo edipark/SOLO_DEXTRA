@@ -1,0 +1,3 @@
+[submodule "SOLO_HW"]
+	path = SOLO_HW
+	url = https://github.com/edipark/SOLO_HW.git
