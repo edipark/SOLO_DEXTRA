@@ -13,7 +13,7 @@ models:
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: -1.6  # Very deterministic start (same as humanoid)
+    initial_log_std: -1.2  # Very deterministic start (same as humanoid)
     fixed_log_std: False
     network:
       - name: net
@@ -89,7 +89,7 @@ agent:
   clip_predicted_values: True
   
   # Loss scales
-  entropy_loss_scale: 0.0
+  entropy_loss_scale: 0.004
   value_loss_scale: 2.5
   discriminator_loss_scale: 6.0
   
@@ -103,7 +103,7 @@ agent:
   discriminator_gradient_penalty_scale: 5.0
   discriminator_weight_decay_scale: 1.0e-04
   
-  time_limit_bootstrap: False
+  time_limit_bootstrap: True
   
   # Logging
   experiment:

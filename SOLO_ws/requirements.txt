@@ -1,4 +1,0 @@
-onnxruntime
-dynamixel-sdk
-numpy
-pyyaml

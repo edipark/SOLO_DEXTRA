@@ -80,16 +80,16 @@ class DextraEventCfg:
         },
     )
 
-    actuator_gains = EventTerm(
-        func=mdp.randomize_actuator_gains,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            "stiffness_distribution_params": (0.9, 1.1),
-            "damping_distribution_params": (0.9, 1.1),
-            "operation": "scale",
-        },
-    )
+    # actuator_gains = EventTerm(
+    #     func=mdp.randomize_actuator_gains,
+    #     mode="startup",
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+    #         "stiffness_distribution_params": (0.9, 1.1),
+    #         "damping_distribution_params": (0.9, 1.1),
+    #         "operation": "scale",
+    #     },
+    # )
 
 
 @configclass
@@ -132,7 +132,7 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
 
     # Task reward: world +X linear velocity tracking (see `_get_rewards` in dextra_amp_env.py).
     # Requires `task_reward_weight > 0` in `agents/skrl_amp_cfg.yaml` to affect learning.
-    target_vel_x_world: float = 0.26 / motion_speed_scale           # m/s desired along world +X
+    target_vel_x_world: float = 0.23 / motion_speed_scale           # m/s desired along world +X
     target_vel_tracking_coeff: float = 0.5   # exp(-coeff * (vx - target)^2); larger = sharper peak
     vel_reward_weight: float = 0.5            # weight within combined task reward
 
@@ -165,19 +165,19 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     # Robot
     # -------------------------------------------------------------------------
     # AX18AActuator: Dynamixel AX-18A compliance model.
-    # Compliance slope=32 → effective stiffness ≈ 11.1 N·m/rad (hardware default).
+    # Compliance slope=64 → slope width ≈ 0.324 rad and effective stiffness ≈ 5.3 N·m/rad.
     # -------------------------------------------------------------------------
     robot: ArticulationCfg = DEXTRA_CFG.replace(prim_path="/World/envs/env_.*/Robot").replace(
         actuators={
             "legs": AX18AActuatorCfg(
                 joint_names_expr=[".*HipYaw.*", ".*HipRoll.*", ".*Thigh.*", ".*Calf.*", ".*Ankle.*"],
                 stall_torque=1.8,        # AX-18A physical motor limit [N·m] (fixed, spec)
-                effort_limit=1.8*0.96,        # Torque Limit register [N·m] (lower to restrict output)
+                effort_limit=1.8*0.2,        # Torque Limit register [N·m] (lower to restrict output)
                 velocity_limit=10.16,    # AX-18A no-load speed [rad/s]
-                damping=0.177,           # back-EMF: τ_stall / ω_no_load = 1.8 / 10.16
+                damping=0.035,           # back-EMF: τ_stall / ω_no_load = 1.8 / 10.16
                 armature=0.00054,        # rotor inertia reflected to joint [kg·m²]
-                friction=0.05,           # PhysX static friction coefficient
-                compliance_slope=64.0,   # AX-18A factory default → k ≈ 11.1 N·m/rad
+                friction=0.0,           # PhysX static friction coefficient. set 0.0 to prevent discontinuities with the AX-18A compliance model
+                compliance_slope=64.0,   # AX-18A register slope; deploy writes the same value on connect
             ),
         },
     )

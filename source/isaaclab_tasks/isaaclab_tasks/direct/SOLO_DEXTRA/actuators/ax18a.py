@@ -260,7 +260,7 @@ class AX18AActuatorCfg(ActuatorBaseCfg):
     compliance_margin: float = 0.29 * (3.14159265358979 / 180.0)
     """Dead-zone half-width [rad].  AX-18A default: 1 unit ≈ 5.06e-3 rad."""
 
-    compliance_slope: float = 32.0
+    compliance_slope: float = 64.0
     """Torque ramp-up width [AX-18A position steps].
 
     Converted to radians internally (step × 5.06e-3 rad).
