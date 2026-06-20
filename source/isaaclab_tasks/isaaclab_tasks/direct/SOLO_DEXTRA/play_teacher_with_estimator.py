@@ -280,11 +280,15 @@ def main() -> None:
                 obs_combined = torch.cat([enc, priv_used], dim=-1)
                 action = teacher(obs_combined)
 
+        # Clamp to [-1, 1] — matches what env._apply_action() actually sends to physics.
+        # Log and replay both use the clamped value so sim logs == HW replay targets.
+        action_clamped = action.clamp(-1.0, 1.0)
+
         if csv_writer is not None:
-            action_cpu = action.detach().to(torch.float32).cpu()
+            action_cpu = action_clamped.detach().to(torch.float32).cpu()
             csv_writer.writerow([timestep, csv_log_env_id] + action_cpu[csv_log_env_id].tolist())
         if action_log_output is not None:
-            action_cpu = action.detach().to(torch.float32).cpu()
+            action_cpu = action_clamped.detach().to(torch.float32).cpu()
             action_log_records.append(action_cpu[action_log_env_id].numpy().copy())
 
         raw_obs, _, terminated, truncated, _ = env.step(action)

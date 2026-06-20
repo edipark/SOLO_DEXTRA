@@ -154,6 +154,10 @@ def run_replay(
     VIDEO_FPS = 30
     capture_every = max(1, round(1.0 / (sim_dt * VIDEO_FPS)))
 
+    # Debug: check motion data validity
+    dof_pos_range = [motion.dof_positions.min().item(), motion.dof_positions.max().item()]
+    body_rot_unique = len(np.unique(motion.body_rotations.cpu().reshape(-1, 4), axis=0))
+
     print(f"\n{'='*60}")
     print(f"  Motion Replay")
     print(f"  File: {args_cli.file}")
@@ -162,6 +166,8 @@ def run_replay(
     print(f"  Robot joints: {robot.data.joint_names}")
     print(f"  Motion DOFs:  {motion.dof_names}")
     print(f"  Bodies: {motion.body_names}")
+    print(f"  DOF range: [{dof_pos_range[0]:.4f}, {dof_pos_range[1]:.4f}]")
+    print(f"  Body rotations: {body_rot_unique} unique quaternions")
     if args_cli.video:
         print(f"  Video: {args_cli.video_length} steps  (capture every {capture_every} steps)")
     print(f"{'='*60}\n")
@@ -205,9 +211,17 @@ def run_replay(
         # Capture video frame at VIDEO_FPS rate
         if video_writer is not None and rgb_annotator is not None:
             if step_idx % capture_every == 0:
-                frame = _get_rgb_frame(rgb_annotator)
-                if frame is not None:
-                    video_writer.append_data(frame)
+                try:
+                    frame = _get_rgb_frame(rgb_annotator)
+                    if frame is not None:
+                        video_writer.append_data(frame)
+                        video_frame_count += 1
+                        if video_frame_count % 30 == 0:
+                            print(f"[VIDEO] Captured {video_frame_count} frames (step {step_idx})")
+                    else:
+                        print(f"[WARNING] Frame {step_idx} is None/empty")
+                except Exception as e:
+                    print(f"[ERROR] Failed to capture/append frame at step {step_idx}: {e}")
 
         if print_vel and step_idx % print_vel_every == 0:
             v_cmd = root_state[0, 7:10].cpu().numpy()
@@ -244,24 +258,45 @@ def main():
     rgb_annotator = None
     render_product = None
     rep_mod = None
+    video_frame_count = 0
     if args_cli.video:
         import imageio
         import pathlib
-        import omni.replicator.core as rep_mod
+        try:
+            import omni.replicator.core as rep_mod
+        except ImportError as e:
+            print(f"[WARNING] Failed to import omni.replicator.core: {e}")
+            print("[WARNING] Video recording disabled. Try: pip install imageio[ffmpeg]")
+            rep_mod = None
 
-        render_product = rep_mod.create.render_product("/OmniverseKit_Persp", (1280, 720))
-        rgb_annotator = rep_mod.AnnotatorRegistry.get_annotator("rgb", device="cpu")
-        rgb_annotator.attach([render_product])
+        if rep_mod is not None:
+            try:
+                render_product = rep_mod.create.render_product("/OmniverseKit_Persp", (1280, 720))
+                rgb_annotator = rep_mod.AnnotatorRegistry.get_annotator("rgb", device="cpu")
+                rgb_annotator.attach([render_product])
+                print(f"[INFO] Render product created: {render_product}")
+            except Exception as e:
+                print(f"[ERROR] Failed to create render product: {e}")
+                rep_mod = None
+                rgb_annotator = None
+                render_product = None
 
-        video_dir = args_cli.video_dir
-        if video_dir is None:
-            video_dir = str(pathlib.Path(args_cli.file).parent / "videos")
-        os.makedirs(video_dir, exist_ok=True)
+        if rgb_annotator is not None:
+            video_dir = args_cli.video_dir
+            if video_dir is None:
+                video_dir = str(pathlib.Path(args_cli.file).parent / "videos")
+            os.makedirs(video_dir, exist_ok=True)
 
-        stem = pathlib.Path(args_cli.file).stem
-        video_path = os.path.join(video_dir, f"{stem}.mp4")
-        video_writer = imageio.get_writer(video_path, fps=30, codec="libx264", quality=8)
-        print(f"[INFO] Recording video to {video_dir}  ({args_cli.video_length} steps)")
+            stem = pathlib.Path(args_cli.file).stem
+            video_path = os.path.join(video_dir, f"{stem}.mp4")
+            try:
+                video_writer = imageio.get_writer(video_path, fps=30, codec="libx264", quality=8)
+                print(f"[INFO] Recording video to {video_path}  ({args_cli.video_length} steps)")
+            except Exception as e:
+                print(f"[ERROR] Failed to create video writer: {e}")
+                video_writer = None
+        else:
+            print("[WARNING] RGB annotator not available, skipping video")
     # ---
 
     if args_cli.matplotlib:
@@ -280,17 +315,25 @@ def main():
     if rgb_annotator is not None and render_product is not None:
         try:
             rgb_annotator.detach([render_product])
-        except Exception:
-            pass
+            print(f"[INFO] Detached annotator")
+        except Exception as e:
+            print(f"[WARNING] Failed to detach annotator: {e}")
     if rep_mod is not None and render_product is not None:
         try:
             rep_mod.destroy.render_product(render_product)
-        except Exception:
-            pass
+            print(f"[INFO] Destroyed render product")
+        except Exception as e:
+            print(f"[WARNING] Failed to destroy render product: {e}")
 
     if video_writer is not None:
-        video_writer.close()
-        print(f"[INFO] Video saved to: {video_path}")
+        try:
+            video_writer.close()
+            print(f"[INFO] Video closed successfully. Total frames: {video_frame_count}")
+            print(f"[INFO] Video saved to: {video_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to close video writer: {e}")
+    else:
+        print("[INFO] No video writer to close")
     # ---
 
 

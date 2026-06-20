@@ -25,8 +25,8 @@
       --vel-scale 0.4
 
   # 4) 전체 파이프라인 한 번에
-  python make_motion_variant.py \\
-      --input dextra_walk_flat_pitch_fk.npz \\
+  python make_motion_variant.py \
+      --input dextra_walk_flat_pitch_fk.npz \
       --target-fps 30 --speed-scale 3.0 --stride-scale 0.6 --vel-scale 0.4
 
   # 5) 루프 경계 불연속 제거 (비주기 모션 → 주기화)

@@ -141,7 +141,7 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     foot_flat_reward_weight: float = 0.5      # weight within combined task reward
     foot_flat_coeff: float = 10.0              # exp(-coeff * (1 - dot)^2)
     # Motion
-    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_2p0x_slower.npz")  # FK motion file (see `motions/create_motion_variant.py`)
+    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p6_vel0p6.npz")  # FK motion file (see `motions/create_motion_variant.py`)
     reference_body = "base_link"
     reset_strategy = "default"  # default, random, random-start
 
@@ -172,7 +172,7 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
             "legs": AX18AActuatorCfg(
                 joint_names_expr=[".*HipYaw.*", ".*HipRoll.*", ".*Thigh.*", ".*Calf.*", ".*Ankle.*"],
                 stall_torque=1.8,        # AX-18A physical motor limit [N·m] (fixed, spec)
-                effort_limit=1.8*0.2,        # Torque Limit register [N·m] (lower to restrict output)
+                effort_limit=1.8,        # Torque Limit register [N·m] (lower to restrict output)
                 velocity_limit=10.16,    # AX-18A no-load speed [rad/s]
                 damping=0.035,           # back-EMF: τ_stall / ω_no_load = 1.8 / 10.16
                 armature=0.00054,        # rotor inertia reflected to joint [kg·m²]
@@ -227,5 +227,5 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
 @configclass
 class DextraAmpWalkEnvCfg(DextraAmpEnvCfg):
     """Dextra AMP Walk environment config."""
-    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_2p0x_slower.npz")
+    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p6_vel0p6.npz")
     # motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk.npz")
