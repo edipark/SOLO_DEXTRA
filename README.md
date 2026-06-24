@@ -1,14 +1,30 @@
 # SOLO_DEXTRA
 
-Humanoid locomotion for the SOLO_DEXTRA robot, trained in Isaac Lab with Adversarial Motion Priors (AMP)
-and deployed on a Raspberry Pi + Dynamixel AX-18A hardware stack.
+### State Estimation with Only Leg Observations
+<img src="assets/walking_1.gif" width="100%" alt="DEXTRA is walking with only leg observations in the Isaac Sim"/>
 
-Repository: <https://github.com/edipark/SOLO_DEXTRA>
+[DEXTRA](https://github.com/edipark/SOLO_HW.git) is trained to walk from reference motions using an [AMP](https://xbpeng.github.io/projects/AMP/index.html)-style RL framework. However, the privileged policy requires base rotation and velocity information that is unavailable during hardware deployment. To address this limitation, an LSTM-based state estimator is employed to predict all states except leg joint positions.
 
-This repository is a stripped-down fork of [Isaac Lab](https://github.com/isaac-sim/IsaacLab)
-that keeps only the framework code required to train, evaluate, and deploy the SOLO_DEXTRA
-policy. Other tasks, demos, tutorials, and training frameworks from upstream Isaac Lab have
-been removed.
+## Phase 1
+<img src="assets/SOLO_outline.001.png" width="100%"/>
+
+*Train a privileged AMP policy using full 43-dim observations (leg joints + privileged states) with combined motion prior and task reward.*
+
+## Phase 2
+<img src="assets/SOLO_outline.002.png" width="100%"/>
+
+*Collect rollouts from the frozen AMP policy and train the LSTM state estimator via supervised learning against simulator ground truth.*
+
+<img src="assets/SOLO_outline.003.png" width="100%"/>
+
+*Iteratively refine the estimator with DAgger — roll out with estimated states and minimize MSE against privileged observations from the ground-truth rollout.*
+
+## Phase 3
+<img src="assets/SOLO_outline.004.png" width="100%"/>
+
+*At inference, the state estimator reconstructs the 19-dim privileged states from leg-only observations (24 dim), supplying the frozen AMP policy with the full 43-dim input.*
+
+
 
 ## Layout
 
