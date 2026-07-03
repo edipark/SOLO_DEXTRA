@@ -74,6 +74,10 @@ parser.add_argument("--thorough", action="store_true")
 parser.add_argument("--skip_history_ablation", action="store_true")
 parser.add_argument("--skip_mlp", action="store_true")
 parser.add_argument("--skip_tcn", action="store_true")
+parser.add_argument("--skip_student", action="store_true",
+                    help="Skip standard policy distillation student comparison")
+parser.add_argument("--student_dagger_rounds", type=int, default=None,
+                    help="DAgger rounds for student distillation (default: dagger_rounds + dagger_extra_rounds)")
 
 # Output
 parser.add_argument("--output_dir", type=str, default="logs/solo_ablation")
@@ -108,6 +112,9 @@ from isaaclab_rl.skrl import SkrlVecEnvWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_tasks  # noqa: F401
+
+import torch.nn as nn
+import torch.nn.functional as F
 
 from solo_models import (
     ENCODER_DIM, PRIV_DIM, OBS_DIM, ACTION_DIM,
@@ -333,6 +340,194 @@ def evaluate_pretrained(env, teacher, device, estimator_dirs, eval_episodes,
 
 
 # ============================================================================
+# STUDENT POLICY DISTILLATION (Standard baseline)
+# ============================================================================
+
+class _StudentMLP(nn.Module):
+    """Standard policy distillation: 24-D leg obs → 12-D action MLP."""
+    def __init__(self, obs_dim: int = ENCODER_DIM, action_dim: int = ACTION_DIM,
+                 hidden_dims: tuple = (256, 256, 128)):
+        super().__init__()
+        layers: list = []
+        d = obs_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(d, h), nn.ELU()]
+            d = h
+        layers.append(nn.Linear(d, action_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class _WelfordNorm:
+    """Online Welford normaliser (no nn.Module, no gradients)."""
+    def __init__(self, dim: int, device: str, clip: float = 5.0):
+        self.mean = torch.zeros(dim, device=device, dtype=torch.float64)
+        self.var  = torch.ones(dim,  device=device, dtype=torch.float64)
+        self.n    = torch.tensor(1e-4, device=device, dtype=torch.float64)
+        self.clip, self.eps = clip, 1e-6
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        x = x.double()
+        bm, bv, bn = x.mean(0), x.var(0, unbiased=False), float(x.shape[0])
+        d = bm - self.mean; total = self.n + bn
+        self.mean += d * bn / total
+        self.var = (self.var * self.n + bv * bn + d**2 * self.n * bn / total) / total
+        self.n = total
+
+    @torch.no_grad()
+    def norm(self, x: torch.Tensor) -> torch.Tensor:
+        std = self.var.float().sqrt().clamp(min=self.eps)
+        return ((x.float() - self.mean.float()) / std).clamp(-self.clip, self.clip)
+
+    @torch.no_grad()
+    def denorm(self, xn: torch.Tensor) -> torch.Tensor:
+        std = self.var.float().sqrt().clamp(min=self.eps)
+        return xn.float() * std + self.mean.float()
+
+
+class _RingBuffer:
+    """Fixed-capacity GPU ring buffer for (obs, action) pairs."""
+    def __init__(self, cap: int, obs_dim: int, act_dim: int, device: str):
+        self._cap = cap; self._ptr = 0; self._sz = 0
+        self._obs = torch.zeros(cap, obs_dim, device=device)
+        self._act = torch.zeros(cap, act_dim, device=device)
+
+    @property
+    def size(self) -> int:
+        return self._sz
+
+    def add(self, obs: torch.Tensor, act: torch.Tensor) -> None:
+        n = obs.shape[0]
+        if n >= self._cap:
+            obs, act, n = obs[-self._cap:], act[-self._cap:], self._cap
+        end = self._ptr + n
+        if end <= self._cap:
+            self._obs[self._ptr:end] = obs; self._act[self._ptr:end] = act
+        else:
+            f = self._cap - self._ptr
+            self._obs[self._ptr:] = obs[:f]; self._act[self._ptr:] = act[:f]
+            r = n - f; self._obs[:r] = obs[f:]; self._act[:r] = act[f:]
+        self._ptr = end % self._cap; self._sz = min(self._sz + n, self._cap)
+
+    def sample(self, bs: int) -> tuple:
+        idx = torch.randint(0, self._sz, (bs,), device=self._obs.device)
+        return self._obs[idx], self._act[idx]
+
+
+def _evaluate_student(env, student, obs_norm, act_norm, num_episodes, max_steps, device):
+    """Episode-based evaluation for the student policy (no privileged state)."""
+    force_skrl_isaaclab_reset(env)
+    obs, _ = env.reset()
+    num_envs = obs.shape[0]
+    completed = []; cur_len = torch.zeros(num_envs, device=device)
+    deaths, timeouts = 0, 0
+    student.eval()
+    with torch.no_grad():
+        while len(completed) < num_episodes:
+            enc_n = obs_norm.norm(obs[:, :ENCODER_DIM])
+            action = act_norm.denorm(student(enc_n))
+            obs, _, term, trunc, _ = env.step(action)
+            cur_len += 1
+            done    = (term | trunc).squeeze()
+            timeout = (cur_len >= max_steps) & (~done)
+            any_done = done | timeout
+            if any_done.any():
+                for idx in any_done.nonzero(as_tuple=True)[0]:
+                    if len(completed) >= num_episodes:
+                        break
+                    ep = {"length": int(cur_len[idx].item()),
+                          "death": bool(term[idx].item()),
+                          "timeout": bool(timeout[idx].item())}
+                    completed.append(ep)
+                    if ep["death"]:   deaths   += 1
+                    if ep["timeout"]: timeouts += 1
+                cur_len[any_done] = 0
+    ep_lengths = [e["length"] for e in completed]
+    return {"avg_episode": float(np.mean(ep_lengths)),
+            "std_episode": float(np.std(ep_lengths)),
+            "death_rate": deaths / num_episodes * 100,
+            "timeout_rate": timeouts / num_episodes * 100,
+            "num_episodes": len(completed)}
+
+
+def run_student_distillation(env, teacher, device, config, model_saver, seed):
+    """Standard policy distillation baseline: AMP teacher → 24-D student MLP via DAgger."""
+    torch.manual_seed(seed); np.random.seed(seed)
+    total_rounds  = config.get("student_dagger_rounds",
+                               config["dagger_rounds"] + config.get("dagger_extra_rounds", 0))
+    rollout_steps = config["collect_steps"]
+    batch_size    = 1024; lr = config["lr"]
+    student  = _StudentMLP().to(device)
+    obs_norm = _WelfordNorm(ENCODER_DIM, device)
+    act_norm = _WelfordNorm(ACTION_DIM, device)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=1e-4)
+    buf = _RingBuffer(500_000, ENCODER_DIM, ACTION_DIM, device)
+    beta = 1.0
+    beta_decay = 0.02 ** (1.0 / max(total_rounds, 1))
+    beta_min = 0.02
+    print(f"\n{'='*60}")
+    print(f"  Student_DAgger  (Seed {seed})")
+    print(f"  24D leg obs → MLP(256,256,128) → 12D action")
+    print(f"  Rounds: {total_rounds},  rollout: {rollout_steps}")
+    print(f"{'='*60}")
+    force_skrl_isaaclab_reset(env)
+    obs, _ = env.reset()
+    rounds_data = []; best_episode = -float("inf"); best_state = None
+    for rd in range(total_rounds + 1):
+        if rd > 0:
+            student.eval(); all_enc, all_act = [], []
+            for _ in range(rollout_steps):
+                enc = obs[:, :ENCODER_DIM]
+                obs_norm.update(enc); enc_n = obs_norm.norm(enc)
+                with torch.no_grad():
+                    teacher_act = teacher(obs)
+                    student_act = act_norm.denorm(student(enc_n))
+                act_norm.update(teacher_act)
+                action = beta * teacher_act + (1.0 - beta) * student_act
+                obs, _, term, trunc, _ = env.step(action)
+                all_enc.append(enc); all_act.append(teacher_act)
+            buf.add(torch.cat(all_enc), torch.cat(all_act))
+            beta = max(beta_min, beta * beta_decay)
+            student.train()
+            n_steps = max(200, 2 * buf.size // batch_size)
+            for _ in range(n_steps):
+                ob, ac = buf.sample(batch_size)
+                loss = F.mse_loss(student(obs_norm.norm(ob)), act_norm.norm(ac))
+                optimizer.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                optimizer.step()
+        result = _evaluate_student(env, student, obs_norm, act_norm,
+                                   config["eval_episodes"], config["max_episode_steps"], device)
+        print(f"    Round {rd:2d}: episode={result['avg_episode']:.1f}  "
+              f"death={result['death_rate']:.1f}%  (beta={beta:.3f})")
+        rounds_data.append({"round": rd, **result})
+        if result["avg_episode"] > best_episode:
+            best_episode = result["avg_episode"]
+            best_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
+            save_dict = {
+                "student_state_dict": student.state_dict(),
+                "obs_normalizer": {"mean": obs_norm.mean.cpu(),
+                                   "var": obs_norm.var.cpu(),
+                                   "n": obs_norm.n.cpu()},
+                "act_normalizer": {"mean": act_norm.mean.cpu(),
+                                   "var": act_norm.var.cpu(),
+                                   "n": act_norm.n.cpu()},
+                "seed": seed, "round": rd, "best_episode": best_episode,
+            }
+            torch.save(save_dict,
+                       os.path.join(model_saver.models_dir,
+                                    f"Student_DAgger_seed{seed}_best.pt"))
+    if best_state is not None:
+        student.load_state_dict(best_state); student.to(device)
+    return {"exp_name": "Student_DAgger", "seed": seed, "window": 0,
+            "est_type": "STUDENT", "use_dagger": True,
+            "rounds": rounds_data, "final": rounds_data[-1]}
+
+
+# ============================================================================
 # AGGREGATION & REPORTING
 # ============================================================================
 
@@ -517,6 +712,7 @@ def main(env_cfg, experiment_cfg):
         "lr": args_cli.lr,
         "noise_levels": NOISE_LEVELS,
         "num_seeds": args_cli.seeds,
+        "student_dagger_rounds": args_cli.student_dagger_rounds or (args_cli.dagger_rounds + args_cli.dagger_extra_rounds),
     }
 
     if args_cli.run_training:
@@ -556,6 +752,14 @@ def main(env_cfg, experiment_cfg):
                     model_saver, name, est_type, window, use_dagger, seed,
                 )
                 seed_results[name] = result
+
+            # Student distillation baseline
+            if not args_cli.skip_student:
+                print(f"\n  [Student DAgger] Standard policy distillation")
+                student_result = run_student_distillation(
+                    env, teacher, device, config, model_saver, seed,
+                )
+                seed_results["Student_DAgger"] = student_result
 
             all_seed_results[seed] = seed_results
 

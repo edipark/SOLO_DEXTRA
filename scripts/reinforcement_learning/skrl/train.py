@@ -38,6 +38,7 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
+parser.add_argument("--experiment_name", type=str, default=None, help="Override experiment name suffix appended to the log directory.")
 parser.add_argument(
     "--reset_log_std",
     type=float,
@@ -179,6 +180,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"Exact experiment name requested from command line: {log_dir}")
     if agent_cfg["agent"]["experiment"]["experiment_name"]:
         log_dir += f"_{agent_cfg['agent']['experiment']['experiment_name']}"
+    # CLI --experiment_name overrides yaml value
+    if args_cli.experiment_name:
+        log_dir += f"_{args_cli.experiment_name}"
     # set directory into agent config
     agent_cfg["agent"]["experiment"]["directory"] = log_root_path
     agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir

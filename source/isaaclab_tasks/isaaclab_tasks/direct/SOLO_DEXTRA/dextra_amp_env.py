@@ -151,6 +151,10 @@ class DextraAmpEnv(DirectRLEnv):
         self._vel_window_ptr = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._vel_window_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # Action buffers for action-rate penalty (anti-jitter)
+        self.actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self.prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot)
         # Ground plane
@@ -178,6 +182,7 @@ class DextraAmpEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        self.prev_actions[:] = self.actions
         self.actions = actions.clone()
 
     def _apply_action(self):
@@ -292,6 +297,13 @@ class DextraAmpEnv(DirectRLEnv):
 
         combined = self.cfg.vel_reward_weight * vel_reward + self.cfg.foot_flat_reward_weight * foot_flat_reward
 
+        # --- action-rate penalty (anti-jitter) ---
+        if self.cfg.action_rate_penalty_weight > 0.0:
+            action_rate_penalty = ((self.actions - self.prev_actions) ** 2).mean(dim=-1)  # (N,)
+            combined = combined - self.cfg.action_rate_penalty_weight * action_rate_penalty
+        else:
+            action_rate_penalty = torch.zeros(self.num_envs, device=self.device)
+
         # --- TensorBoard (SKRL): trainer only logs infos["log"] values that are scalar tensors ---
         prev_log = self.extras.get("log") if isinstance(self.extras.get("log"), dict) else {}
         self.extras["log"] = {
@@ -299,6 +311,7 @@ class DextraAmpEnv(DirectRLEnv):
             "reward/vel_tracking": vel_reward.mean().detach(),
             "reward/foot_flat": foot_flat_reward.mean().detach(),
             "reward/task_combined": combined.mean().detach(),
+            "reward/action_rate_penalty": action_rate_penalty.mean().detach(),
             "metric/base_vel_x": vx.mean().detach(),
             "metric/foot_dot_z": dot.mean().detach(),
             "metric/base_height": self.robot.data.body_pos_w[:, self.ref_body_index, 2].mean().detach(),
@@ -354,6 +367,10 @@ class DextraAmpEnv(DirectRLEnv):
         # Reset rolling vx buffer for terminated envs (refill with large value for grace period)
         self._vel_window_buf[env_ids] = 1e3
         self._vel_window_count[env_ids] = 0
+
+        # Reset action buffers so the first step after reset has no spurious penalty
+        self.prev_actions[env_ids] = 0.0
+        self.actions[env_ids] = 0.0
 
         if self.cfg.reset_strategy == "default":
             root_state, joint_pos, joint_vel = self._reset_strategy_default(env_ids)
