@@ -19,6 +19,11 @@ PRIV_DIM = 19      # Teacher가 사용하는 privileged state
 OBS_DIM = 43       # ENCODER_DIM + PRIV_DIM
 ACTION_DIM = 12    # 관절 토크 명령
 
+# Hardware-accurate observation pipeline constants
+# sim: dt=1/120, decimation=4  →  policy runs at 30 Hz
+POLICY_DT: float = 4.0 / 120.0          # 1/30 s
+AX18A_RAD_PER_TICK: float = 0.29 * (3.14159265358979 / 180.0)  # ≈ 0.00506 rad
+
 PRIV_NAMES = [
     "base_height", "tangent_x", "tangent_y", "tangent_z",
     "normal_x", "normal_y", "normal_z",
@@ -302,13 +307,67 @@ class SkrlAgentWrapper:
 # ============================================================================
 
 class DataCollector:
-    """Teacher rollout에서 (history, privileged, single_frame) 데이터를 수집."""
+    """Teacher rollout에서 (history, privileged, single_frame) 데이터를 수집.
 
-    def __init__(self, window, encoder_dim=ENCODER_DIM, priv_dim=PRIV_DIM, device="cuda"):
+    Hardware-accurate observation pipeline (기본값 True):
+      use_finite_diff_vel  : sim physics velocity 대신 finite-diff로 속도 계산
+      ax18a_quantize       : AX-18A 0.29°/tick 양자화를 위치에 적용
+      ema_alpha            : deploy.py와 동일한 EMA 필터 (0 = 비활성화)
+    False로 설정하면 기존 sim clean-velocity 경로를 사용한다.
+    """
+
+    def __init__(self, window, encoder_dim=ENCODER_DIM, priv_dim=PRIV_DIM, device="cuda",
+                 use_finite_diff_vel: bool = True,
+                 ax18a_quantize: bool = True,
+                 ema_alpha: float = 0.2):
         self.window = window
         self.encoder_dim = encoder_dim
         self.priv_dim = priv_dim
         self.device = device
+        self.use_finite_diff_vel = use_finite_diff_vel
+        self.ax18a_quantize = ax18a_quantize
+        self.ema_alpha = ema_alpha
+
+    # ------------------------------------------------------------------
+    # Hardware-accurate encoder observation builder
+    # ------------------------------------------------------------------
+    def _build_enc(self,
+                   obs: torch.Tensor,
+                   prev_pos_q: torch.Tensor | None,
+                   ema_vel: torch.Tensor) -> tuple:
+        """Build 24-D encoder obs, optionally replicating hardware pipeline.
+
+        Returns:
+            enc       : (N, 24)  encoder observation to feed into LSTM buffer
+            pos_q     : (N, 12)  (quantized) joint positions — use as next prev_pos_q
+            ema_vel   : (N, 12)  updated EMA velocity state
+        """
+        joint_pos = obs[:, :12]
+
+        if not self.use_finite_diff_vel:
+            # Original path: use sim physics velocity directly
+            return obs[:, :self.encoder_dim], joint_pos, ema_vel
+
+        # 1. AX-18A position quantization
+        if self.ax18a_quantize:
+            pos_q = (joint_pos / AX18A_RAD_PER_TICK).round() * AX18A_RAD_PER_TICK
+        else:
+            pos_q = joint_pos
+
+        # 2. Finite-difference velocity (zero on first step / after reset)
+        if prev_pos_q is None:
+            raw_vel = torch.zeros_like(joint_pos)
+        else:
+            raw_vel = (pos_q - prev_pos_q) / POLICY_DT
+
+        # 3. EMA filter (matches deploy.py: filtered = alpha*raw + (1-alpha)*prev)
+        if self.ema_alpha > 0.0:
+            ema_vel = self.ema_alpha * raw_vel + (1.0 - self.ema_alpha) * ema_vel
+        else:
+            ema_vel = raw_vel
+
+        enc = torch.cat([joint_pos, ema_vel], dim=-1)
+        return enc, pos_q, ema_vel
 
     def collect_with_teacher_gt(self, env, teacher, num_steps, noise=0.0):
         """Teacher + GT privileged info로 rollout하며 데이터 수집."""
@@ -322,9 +381,13 @@ class DataCollector:
         stats = {"samples": 0, "ep_lengths": [], "deaths": 0,
                  "ep_len": torch.zeros(num_envs, device=self.device)}
 
+        # Hardware-accurate velocity pipeline state
+        prev_pos_q: torch.Tensor | None = None
+        ema_vel = torch.zeros(num_envs, 12, device=self.device)
+
         with torch.no_grad():
             for _ in range(num_steps):
-                enc = obs[:, :self.encoder_dim]
+                enc, prev_pos_q, ema_vel = self._build_enc(obs, prev_pos_q, ema_vel)
                 priv = obs[:, self.encoder_dim:self.encoder_dim + self.priv_dim]
 
                 buf = torch.roll(buf, -1, dims=1)
@@ -352,6 +415,13 @@ class DataCollector:
                     stats["ep_len"][done] = 0
                     buf[done] = 0
                     valid[done] = 0
+                    # Reset velocity state: set prev_pos to new obs so next-step vel=0
+                    if self.use_finite_diff_vel:
+                        new_pos = obs[done, :12]
+                        if self.ax18a_quantize:
+                            new_pos = (new_pos / AX18A_RAD_PER_TICK).round() * AX18A_RAD_PER_TICK
+                        prev_pos_q[done] = new_pos
+                        ema_vel[done] = 0.0
 
         if not histories:
             return None, None, None, {}
@@ -383,12 +453,16 @@ class DataCollector:
             "ep_len": torch.zeros(num_envs, device=self.device),
         }
 
+        # Hardware-accurate velocity pipeline state
+        prev_pos_q: torch.Tensor | None = None
+        ema_vel = torch.zeros(num_envs, 12, device=self.device)
+
         teacher.eval()
         estimator.eval()
 
         with torch.no_grad():
             for _ in range(num_steps):
-                enc = obs[:, :self.encoder_dim]
+                enc, prev_pos_q, ema_vel = self._build_enc(obs, prev_pos_q, ema_vel)
                 priv_gt = obs[:, self.encoder_dim:self.encoder_dim + self.priv_dim]
 
                 buf = torch.roll(buf, -1, dims=1)
@@ -428,6 +502,13 @@ class DataCollector:
                     stats["ep_len"][done] = 0
                     buf[done] = 0
                     valid[done] = 0
+                    # Reset velocity state: set prev_pos to new obs so next-step vel=0
+                    if self.use_finite_diff_vel:
+                        new_pos = obs[done, :12]
+                        if self.ax18a_quantize:
+                            new_pos = (new_pos / AX18A_RAD_PER_TICK).round() * AX18A_RAD_PER_TICK
+                        prev_pos_q[done] = new_pos
+                        ema_vel[done] = 0.0
 
         if not histories:
             return None, None, None, {}
@@ -449,15 +530,46 @@ class DataCollector:
 # ============================================================================
 
 class Evaluator:
-    """Episode 단위 평가기: death/timeout 구분, 통계 산출."""
+    """Episode 단위 평가기: death/timeout 구분, 통계 산출.
+
+    use_finite_diff_vel/ax18a_quantize/ema_alpha 는 DataCollector와 동일한 하드웨어 파이프라인을 제어한다.
+    collect와 eval 조건을 일치시켜야 정확한 비교가 가능하다.
+    """
 
     def __init__(self, window, encoder_dim=ENCODER_DIM, priv_dim=PRIV_DIM,
-                 max_episode_steps=1000, device="cuda"):
+                 max_episode_steps=1000, device="cuda",
+                 use_finite_diff_vel: bool = True,
+                 ax18a_quantize: bool = True,
+                 ema_alpha: float = 0.6):
         self.window = window
         self.encoder_dim = encoder_dim
         self.priv_dim = priv_dim
         self.max_episode_steps = max_episode_steps
         self.device = device
+        self.use_finite_diff_vel = use_finite_diff_vel
+        self.ax18a_quantize = ax18a_quantize
+        self.ema_alpha = ema_alpha
+
+    # ------------------------------------------------------------------
+    # Hardware-accurate encoder observation builder (DataCollector와 동일)
+    # ------------------------------------------------------------------
+    def _build_enc(self,
+                   obs: torch.Tensor,
+                   prev_pos_q: torch.Tensor | None,
+                   ema_vel: torch.Tensor) -> tuple:
+        joint_pos = obs[:, :12]
+        if not self.use_finite_diff_vel:
+            return obs[:, :self.encoder_dim], joint_pos, ema_vel
+        if self.ax18a_quantize:
+            pos_q = (joint_pos / AX18A_RAD_PER_TICK).round() * AX18A_RAD_PER_TICK
+        else:
+            pos_q = joint_pos
+        if prev_pos_q is None:
+            raw_vel = torch.zeros_like(joint_pos)
+        else:
+            raw_vel = (pos_q - prev_pos_q) / POLICY_DT
+        ema_vel = self.ema_alpha * raw_vel + (1.0 - self.ema_alpha) * ema_vel if self.ema_alpha > 0.0 else raw_vel
+        return torch.cat([joint_pos, ema_vel], dim=-1), pos_q, ema_vel
 
     def evaluate_teacher_gt(self, env, teacher, num_episodes, seed=None):
         """Teacher + GT privileged info 기준 baseline 평가."""
@@ -528,12 +640,16 @@ class Evaluator:
         cur_len = torch.zeros(num_envs, device=self.device)
         deaths, timeouts = 0, 0
 
+        # Hardware-accurate velocity pipeline state
+        prev_pos_q: torch.Tensor | None = None
+        ema_vel = torch.zeros(num_envs, 12, device=self.device)
+
         teacher.eval()
         estimator.eval()
 
         with torch.no_grad():
             while len(completed_episodes) < num_episodes:
-                enc = obs[:, :self.encoder_dim]
+                enc, prev_pos_q, ema_vel = self._build_enc(obs, prev_pos_q, ema_vel)
 
                 buf = torch.roll(buf, -1, dims=1)
                 buf[:, -1] = enc
@@ -573,6 +689,12 @@ class Evaluator:
                     cur_len[any_done] = 0
                     buf[any_done] = 0
                     valid[any_done] = 0
+                    if self.use_finite_diff_vel:
+                        new_pos = obs[any_done, :12]
+                        if self.ax18a_quantize:
+                            new_pos = (new_pos / AX18A_RAD_PER_TICK).round() * AX18A_RAD_PER_TICK
+                        prev_pos_q[any_done] = new_pos
+                        ema_vel[any_done] = 0.0
 
         ep_lengths = [e["length"] for e in completed_episodes]
         return {

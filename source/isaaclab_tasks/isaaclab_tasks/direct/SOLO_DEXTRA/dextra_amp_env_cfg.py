@@ -19,13 +19,36 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import UniformNoiseCfg
 
 MOTIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motions")
+
+
+def configure_joint_velocity_observation_noise(env, env_ids, noise_cfg: UniformNoiseCfg):
+    """Register joint-velocity sensor noise without changing the simulated state."""
+    del env_ids
+    env._joint_velocity_observation_noise_cfg = noise_cfg
 
 
 @configclass
 class DextraEventCfg:
     """Domain randomization events for the Dextra robot."""
+
+    # AX-18A position resolution is about 0.0051 rad/tick. At the 30 Hz policy
+    # rate, differentiating quantized positions produces velocity steps of about
+    # 0.154 rad/s. Corrupt only the policy joint-velocity observation; the
+    # simulated joint state and discriminator AMP observations stay noise-free.
+    joint_velocity_observation_noise = EventTerm(
+        func=configure_joint_velocity_observation_noise,
+        mode="startup",
+        params={
+            "noise_cfg": UniformNoiseCfg(
+                n_min=-0.15,
+                n_max=0.15,
+                operation="add",
+            ),
+        },
+    )
 
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
@@ -144,9 +167,9 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     # Action-rate penalty: penalizes rapid target changes between consecutive steps.
     # Reduces joint jittering. Penalty = mean(||a_t - a_{t-1}||^2) across joints.
     # Set > 0 to activate; start small (e.g. 0.01) and tune up.
-    action_rate_penalty_weight: float = 0.1
+    action_rate_penalty_weight: float = 0.2
     # Motion
-    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_2p0x_slower.npz")  # FK motion file (see `motions/create_motion_variant.py`)
+    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p5_vel0p4.npz")  # FK motion file (see `motions/create_motion_variant.py`)
     reference_body = "base_link"
     reset_strategy = "default"  # default, random, random-start
 
@@ -232,5 +255,5 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
 @configclass
 class DextraAmpWalkEnvCfg(DextraAmpEnvCfg):
     """Dextra AMP Walk environment config."""
-    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_2p0x_slower.npz")
+    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p5_vel0p4.npz")
     # motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk.npz")

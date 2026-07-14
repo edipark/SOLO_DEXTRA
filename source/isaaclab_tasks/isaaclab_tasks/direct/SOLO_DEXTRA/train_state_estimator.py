@@ -187,7 +187,9 @@ def main(env_cfg, experiment_cfg):
 
     # ── Output directory ──
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = f"{est_type}_w{window}_seed{args_cli.seed}_{timestamp}"
+    # teacher experiment name: .../logs/skrl/dextra_amp_walk/{exp_name}/checkpoints/best_agent.pt
+    teacher_exp = os.path.basename(os.path.dirname(os.path.dirname(args_cli.teacher_checkpoint)))
+    run_name = f"{est_type}_w{window}_seed{args_cli.seed}_{teacher_exp}"
     run_dir = os.path.join(args_cli.output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     print(f"\n[Output] {run_dir}")

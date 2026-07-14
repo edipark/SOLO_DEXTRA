@@ -190,7 +190,7 @@ class DextraAmpEnv(DirectRLEnv):
         target = self.action_offset + self.action_scale * actions
         self.robot.set_joint_position_target(target)
 
-    def _compute_fk_policy_obs(self) -> torch.Tensor:
+    def _compute_fk_policy_obs(self, joint_vel_obs: torch.Tensor) -> torch.Tensor:
         """
         Compute policy observations for FK mode (31D)
         Encoder (24D) + FK (7D)
@@ -199,7 +199,7 @@ class DextraAmpEnv(DirectRLEnv):
         # Encoder observations (24D)
         encoder_obs = torch.cat([
             self.robot.data.joint_pos,              # 12D
-            self.robot.data.joint_vel,  # 12D
+            joint_vel_obs,                          # 12D, sensor-noised during DR
         ], dim=-1)
         
         # FK observations (7D)
@@ -221,14 +221,19 @@ class DextraAmpEnv(DirectRLEnv):
         #     self.robot.data.body_pos_w[:, self.key_body_indexes],
         # )
 
+        joint_vel_obs = self.robot.data.joint_vel
+        noise_cfg = getattr(self, "_joint_velocity_observation_noise_cfg", None)
+        if noise_cfg is not None:
+            joint_vel_obs = noise_cfg.func(joint_vel_obs, noise_cfg)
+
         if self.cfg.use_fk_observations:
             # FK mode: 31D policy observations
-            policy_obs = self._compute_fk_policy_obs()
+            policy_obs = self._compute_fk_policy_obs(joint_vel_obs)
         else:
             # Default: 43D full privileged
             policy_obs = compute_obs(
                 self.robot.data.joint_pos,
-                self.robot.data.joint_vel,
+                joint_vel_obs,
                 self.robot.data.body_pos_w[:, self.ref_body_index],
                 self.robot.data.body_quat_w[:, self.ref_body_index],
                 self.robot.data.body_lin_vel_w[:, self.ref_body_index],
