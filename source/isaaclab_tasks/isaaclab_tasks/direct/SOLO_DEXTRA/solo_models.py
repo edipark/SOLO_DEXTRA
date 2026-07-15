@@ -540,7 +540,7 @@ class Evaluator:
                  max_episode_steps=1000, device="cuda",
                  use_finite_diff_vel: bool = True,
                  ax18a_quantize: bool = True,
-                 ema_alpha: float = 0.6):
+                 ema_alpha: float = 0.2):
         self.window = window
         self.encoder_dim = encoder_dim
         self.priv_dim = priv_dim

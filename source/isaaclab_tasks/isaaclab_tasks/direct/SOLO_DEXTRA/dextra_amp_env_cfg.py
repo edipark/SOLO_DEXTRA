@@ -143,7 +143,7 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     # Termination
     early_termination = True
     termination_height = 0.15   # Base link below 15cm → die
-    termination_min_vel_x: float = 0.02  # Instantaneous vx threshold (0.0 = disabled)
+    termination_min_vel_x: float = 0.0  # Instantaneous vx threshold (0.0 = disabled)
     # termination_min_vel_x: float = 0.0  # Instantaneous vx threshold (disabled; relying on windowed velocity termination instead)
     
     # Windowed-average velocity termination: kills env if the rolling mean vx
@@ -155,13 +155,13 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
 
     # Task reward: world +X linear velocity tracking (see `_get_rewards` in dextra_amp_env.py).
     # Requires `task_reward_weight > 0` in `agents/skrl_amp_cfg.yaml` to affect learning.
-    target_vel_x_world: float = 0.23 / motion_speed_scale           # m/s desired along world +X
-    target_vel_tracking_coeff: float = 0.5   # exp(-coeff * (vx - target)^2); larger = sharper peak
+    target_vel_x_world: float = 0.1 / motion_speed_scale           # m/s desired along world +X
+    target_vel_tracking_coeff: float = 200.0   # exp(-coeff * (vx - target)^2); larger = sharper peak
     vel_reward_weight: float = 0.5            # weight within combined task reward
 
     # Foot-flat reward: penalizes feet tilting away from ground-parallel.
     # Foot local Z-axis (URDF up-axis) vs world Z dot product; 1.0 = perfectly flat.
-    foot_flat_reward_weight: float = 0.5      # weight within combined task reward
+    foot_flat_reward_weight: float = 0.0     # weight within combined task reward
     foot_flat_coeff: float = 10.0              # exp(-coeff * (1 - dot)^2)
 
     # Action-rate penalty: penalizes rapid target changes between consecutive steps.

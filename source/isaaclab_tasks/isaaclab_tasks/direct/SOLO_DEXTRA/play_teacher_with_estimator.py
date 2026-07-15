@@ -95,11 +95,12 @@ import torch
 import isaaclab_tasks  # noqa: F401
 
 from solo_models import (
-    ENCODER_DIM, PRIV_DIM, OBS_DIM,
+    AX18A_RAD_PER_TICK, ENCODER_DIM, PRIV_DIM, OBS_DIM,
     TeacherPolicy, load_estimator,
 )
 
-POLICY_DT = (1.0 / 120.0) * 2
+POLICY_DT = (1.0 / 120.0) * 4  # sim dt * decimation = 1/30 s
+EMA_ALPHA = 0.2  # Must match estimator training and SOLO_HW/config.yaml
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +244,12 @@ def main() -> None:
         hist_buf = torch.zeros((num_envs, window, ENCODER_DIM), device=device)
         hist_valid = torch.zeros(num_envs, device=device, dtype=torch.long)
 
+        # Hardware-accurate joint-velocity pipeline state. The estimator was
+        # trained with AX-18A position quantization, finite differences at the
+        # 30 Hz policy rate, and an EMA velocity filter.
+        prev_pos_q = None
+        ema_vel = torch.zeros((num_envs, 12), device=device)
+
     # --- play loop ---
     print(f"[play] Running AMP teacher + estimator (num_envs={num_envs})…")
     timestep = 0
@@ -256,7 +263,15 @@ def main() -> None:
                     break
                 action = replay_actions_torch[timestep].unsqueeze(0).repeat(num_envs, 1)
             else:
-                enc = obs[:, :ENCODER_DIM]
+                joint_pos = obs[:, :12]
+                pos_q = (joint_pos / AX18A_RAD_PER_TICK).round() * AX18A_RAD_PER_TICK
+                if prev_pos_q is None:
+                    raw_vel = torch.zeros_like(joint_pos)
+                else:
+                    raw_vel = (pos_q - prev_pos_q) / POLICY_DT
+                ema_vel = EMA_ALPHA * raw_vel + (1.0 - EMA_ALPHA) * ema_vel
+                prev_pos_q = pos_q
+                enc = torch.cat([joint_pos, ema_vel], dim=-1)
 
                 # update history
                 hist_buf = torch.roll(hist_buf, -1, dims=1)
@@ -299,6 +314,11 @@ def main() -> None:
             with torch.inference_mode():
                 hist_buf[reset_mask] = 0
                 hist_valid[reset_mask] = 0
+                new_pos = obs[reset_mask, :12]
+                prev_pos_q[reset_mask] = (
+                    new_pos / AX18A_RAD_PER_TICK
+                ).round() * AX18A_RAD_PER_TICK
+                ema_vel[reset_mask] = 0.0
 
         timestep += 1
 
