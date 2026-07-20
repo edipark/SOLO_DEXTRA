@@ -155,6 +155,17 @@ class DextraAmpEnv(DirectRLEnv):
         self.actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self.prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
 
+        # Rolling statistics over the most recent ``num_envs`` completed
+        # episodes. Keeping one entry per episode avoids bias when many
+        # environments time out together but deaths happen in smaller batches.
+        self._episode_stats_capacity = self.num_envs
+        self._episode_stats_count = 0
+        self._episode_stats_write_index = 0
+        self._completed_episode_lengths = torch.zeros(
+            self._episode_stats_capacity, dtype=torch.float32, device=self.device
+        )
+        self._completed_episode_timeouts = torch.zeros_like(self._completed_episode_lengths)
+
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot)
         # Ground plane
@@ -357,11 +368,76 @@ class DextraAmpEnv(DirectRLEnv):
 
         if "log" not in self.extras or not isinstance(self.extras["log"], dict):
             self.extras["log"] = {}
-        self.extras["log"]["episode/deaths"] = died.sum().to(dtype=torch.float32).detach()
-        self.extras["log"]["episode/timeouts"] = time_out.sum().to(dtype=torch.float32).detach()
-        self.extras["log"]["episode/mean_length"] = self.episode_length_buf.float().mean().detach()
+        log = self.extras["log"]
+        log["episode/deaths"] = died.sum().to(dtype=torch.float32).detach()
+        log["episode/timeouts"] = time_out.sum().to(dtype=torch.float32).detach()
+
+        self._log_completed_episode_metrics(died, time_out, log)
 
         return died, time_out
+
+    def _log_completed_episode_metrics(
+        self, died: torch.Tensor, time_out: torch.Tensor, log: dict[str, torch.Tensor]
+    ) -> None:
+        """Update and log statistics over recently completed episodes.
+
+        The rolling window contains one sample per completed episode and has a
+        capacity equal to the number of parallel environments. An episode that
+        is both terminal and at the horizon is classified as a death, not as a
+        successful timeout, so the timeout and death fractions sum to one.
+        """
+        completed_ids = (died | time_out).nonzero(as_tuple=False).squeeze(-1)
+        num_completed = completed_ids.numel()
+
+        if num_completed > 0:
+            completed_lengths = self.episode_length_buf[completed_ids].to(dtype=torch.float32)
+            completed_timeouts = (time_out[completed_ids] & ~died[completed_ids]).to(dtype=torch.float32)
+
+            capacity = self._episode_stats_capacity
+            if num_completed >= capacity:
+                self._completed_episode_lengths[:] = completed_lengths[-capacity:]
+                self._completed_episode_timeouts[:] = completed_timeouts[-capacity:]
+                self._episode_stats_write_index = 0
+                self._episode_stats_count = capacity
+            else:
+                write_index = self._episode_stats_write_index
+                first_count = min(num_completed, capacity - write_index)
+                first_slice = slice(write_index, write_index + first_count)
+                self._completed_episode_lengths[first_slice] = completed_lengths[:first_count]
+                self._completed_episode_timeouts[first_slice] = completed_timeouts[:first_count]
+
+                remaining = num_completed - first_count
+                if remaining > 0:
+                    self._completed_episode_lengths[:remaining] = completed_lengths[first_count:]
+                    self._completed_episode_timeouts[:remaining] = completed_timeouts[first_count:]
+
+                self._episode_stats_write_index = (write_index + num_completed) % capacity
+                self._episode_stats_count = min(capacity, self._episode_stats_count + num_completed)
+
+        completed_metric_keys = (
+            "episode/mean_length",
+            "episode/mean_length_s",
+            "episode/timeout_fraction",
+            "episode/death_fraction",
+            "episode/stats_window_count",
+        )
+        if self._episode_stats_count == 0:
+            for key in completed_metric_keys:
+                log.pop(key, None)
+            return
+
+        valid_slice = slice(None) if self._episode_stats_count == self._episode_stats_capacity else slice(
+            0, self._episode_stats_count
+        )
+        mean_length = self._completed_episode_lengths[valid_slice].mean()
+        timeout_fraction = self._completed_episode_timeouts[valid_slice].mean()
+        log["episode/mean_length"] = mean_length.detach()
+        log["episode/mean_length_s"] = (mean_length * self.step_dt).detach()
+        log["episode/timeout_fraction"] = timeout_fraction.detach()
+        log["episode/death_fraction"] = (1.0 - timeout_fraction).detach()
+        log["episode/stats_window_count"] = torch.tensor(
+            self._episode_stats_count, dtype=torch.float32, device=self.device
+        )
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:

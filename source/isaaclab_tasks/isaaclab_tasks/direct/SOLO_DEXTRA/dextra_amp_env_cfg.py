@@ -7,10 +7,12 @@ from __future__ import annotations
 import os
 from dataclasses import MISSING
 
+import torch
+
 from .dextra_robot_cfg import DEXTRA_CFG
 
 from isaaclab.actuators import DCMotorCfg, ImplicitActuatorCfg
-from .actuators import AX18AActuatorCfg
+from .actuators import AX18AActuator, AX18AActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 import isaaclab.envs.mdp as mdp
@@ -28,6 +30,49 @@ def configure_joint_velocity_observation_noise(env, env_ids, noise_cfg: UniformN
     """Register joint-velocity sensor noise without changing the simulated state."""
     del env_ids
     env._joint_velocity_observation_noise_cfg = noise_cfg
+
+
+def randomize_ax18a_effort_limit(env, env_ids, asset_cfg: SceneEntityCfg):
+    """Randomize one AX-18A effort-limit ratio per environment.
+
+    Every AX-18A joint in a given environment receives the same sampled ratio,
+    while different environments receive independent ratios. The cached punch
+    torque is updated together with the effort limit so the compliance profile
+    remains consistent with the hardware register model.
+    """
+    asset = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device=asset.device)
+    else:
+        env_ids = torch.as_tensor(env_ids, device=asset.device, dtype=torch.long)
+
+    ratio_min, ratio_max = env.cfg.effort_limit_ratio_range
+    if ratio_min <= 0.0 or ratio_max < ratio_min or ratio_max > 1.0:
+        raise ValueError(
+            "effort_limit_ratio_range must satisfy 0 < min <= max <= 1; "
+            f"got {env.cfg.effort_limit_ratio_range}"
+        )
+
+    ratios = torch.empty((env_ids.numel(), 1), device=asset.device).uniform_(ratio_min, ratio_max)
+    effort_limits = env.cfg.ax18a_stall_torque * ratios
+
+    for actuator in asset.actuators.values():
+        if not isinstance(actuator, AX18AActuator):
+            continue
+        actuator_effort_limits = effort_limits.expand(-1, actuator.num_joints)
+        actuator.effort_limit[env_ids] = actuator_effort_limits
+        actuator._punch_torque[env_ids] = (
+            float(actuator.cfg.punch) / 1023.0 * actuator_effort_limits
+        )
+
+    # Keep the sampled ratios available for diagnostics and effort-bin eval.
+    if not hasattr(env, "_ax18a_effort_limit_ratio"):
+        env._ax18a_effort_limit_ratio = torch.full(
+            (env.scene.num_envs,),
+            float(env.cfg.effort_limit_ratio),
+            device=asset.device,
+        )
+    env._ax18a_effort_limit_ratio[env_ids] = ratios.squeeze(-1)
 
 
 @configclass
@@ -50,6 +95,12 @@ class DextraEventCfg:
         },
     )
 
+    ax18a_effort_limit = EventTerm(
+        func=randomize_ax18a_effort_limit,
+        mode="startup",
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*")},
+    )
+
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
@@ -62,7 +113,7 @@ class DextraEventCfg:
             "make_consistent": True,
         },
     )
-    
+
     add_thigh_mass = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
@@ -120,11 +171,15 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     """Dextra AMP environment config (base class)."""
     use_fk_observations: bool = False  # --fk flag로 활성화
 
-
+    # AX-18A torque-limit model. The nominal ratio configures the actuator
+    # before startup DR; the range samples one shared ratio per environment.
+    ax18a_stall_torque: float = 1.8
+    effort_limit_ratio: float = 0.3
+    effort_limit_ratio_range: tuple[float, float] = (0.25, 0.35)
 
     # Episode
     #episode_length_s = 10.0
-    episode_length_s = 20 # For much more stable reading, need to look at longer frames
+    episode_length_s = 20
     #decimation = 2  # 60Hz control (120Hz physics / 2)
     decimation = 4 # For stable control, conservative projections regarding control loop
     motion_speed_scale: float = 1.0            # Scale factor for motion playback speed (default: 1.0)
@@ -145,11 +200,7 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     termination_height = 0.15   # Base link below 15cm → die
     termination_min_vel_x: float = 0.0  # Instantaneous vx threshold (0.0 = disabled)
     # termination_min_vel_x: float = 0.0  # Instantaneous vx threshold (disabled; relying on windowed velocity termination instead)
-    
-    # Windowed-average velocity termination: kills env if the rolling mean vx
-    # over the last `vel_window_steps` control steps stays below `vel_window_min_vx`.
-    # Grace period: the check is skipped for the first `vel_window_steps` steps of
-    # each episode so that the robot has time to accelerate from rest.
+
     vel_window_min_vx: float = 0.0   # m/s  (set 0.0 to disable)
     vel_window_steps: int = 4        # number of control steps to average over (~2s @ 30Hz)
 
@@ -167,7 +218,7 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     # Action-rate penalty: penalizes rapid target changes between consecutive steps.
     # Reduces joint jittering. Penalty = mean(||a_t - a_{t-1}||^2) across joints.
     # Set > 0 to activate; start small (e.g. 0.01) and tune up.
-    action_rate_penalty_weight: float = 0.2
+    action_rate_penalty_weight: float = 0.5
     # Motion
     motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p5_vel0p4.npz")  # FK motion file (see `motions/create_motion_variant.py`)
     reference_body = "base_link"
@@ -199,8 +250,8 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
         actuators={
             "legs": AX18AActuatorCfg(
                 joint_names_expr=[".*HipYaw.*", ".*HipRoll.*", ".*Thigh.*", ".*Calf.*", ".*Ankle.*"],
-                stall_torque=1.8,        # AX-18A physical motor limit [N·m] (fixed, spec)
-                effort_limit=1.8*0.2,        # Torque Limit register [N·m] (lower to restrict output)
+                stall_torque=ax18a_stall_torque,  # AX-18A physical motor limit [N·m] (fixed, spec)
+                effort_limit=ax18a_stall_torque * effort_limit_ratio,
                 velocity_limit=10.16,    # AX-18A no-load speed [rad/s]
                 damping=0.177,           # back-EMF: τ_stall / ω_no_load = 1.8 / 10.16 or 0.035
                 armature=0.00054,        # rotor inertia reflected to joint [kg·m²]

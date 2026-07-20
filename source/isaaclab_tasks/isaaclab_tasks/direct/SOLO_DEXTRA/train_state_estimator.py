@@ -139,7 +139,8 @@ def main(env_cfg, experiment_cfg):
 
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = device
-    env_cfg.events = None  # DR은 AMP 학습 시에만 적용
+    # Keep DextraEventCfg enabled so estimator collection and DAgger rollouts
+    # cover the same randomized physical dynamics used during AMP training.
     env_cfg.termination_min_vel_x = 0.0  # 속도 terminate 비활성화 (estimator warm-up 보호)
     env_cfg.vel_window_min_vx = 0.0      # windowed 속도 terminate도 비활성화
 

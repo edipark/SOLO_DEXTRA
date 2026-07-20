@@ -95,8 +95,8 @@ agent:
   
   # AMP specific
   amp_batch_size: 512
-  task_reward_weight: 0.0  # Pure AMP - no task reward!
-  style_reward_weight: 1.0
+  task_reward_weight: 0.5  # Pure AMP - no task reward!
+  style_reward_weight: 0.5
   discriminator_batch_size: 4096
   discriminator_reward_scale: 2.0
   discriminator_logit_regularization_scale: 0.05
