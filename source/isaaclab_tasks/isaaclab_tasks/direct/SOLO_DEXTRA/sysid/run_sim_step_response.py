@@ -359,23 +359,23 @@ def main() -> None:
         phase, offset_rad = command_at_time(command_time, segments)
         target_rad = baseline_rad + offset_rad
 
-        for robot, joint_index, baseline_target in zip(robots, joint_indices, baseline_targets):
+        # Log the state at command_time together with the torque computed from
+        # that same state. The torque is then applied over [t, t + sim_dt).
+        # This avoids pairing a pre-step torque with a post-step velocity.
+        for damping, robot, joint_index, baseline_target in zip(
+            args_cli.damping_values, robots, joint_indices, baseline_targets
+        ):
             target = baseline_target.clone()
             target[:, joint_index] = target_rad
             robot.set_joint_position_target(target)
             robot.write_data_to_sim()
 
-        sim.step()
-        sample_time = (step_index + 1) * sim_dt
-
-        for damping, robot, joint_index in zip(args_cli.damping_values, robots, joint_indices):
-            robot.update(sim_dt)
             position = float(robot.data.joint_pos[0, joint_index].item())
             velocity = float(robot.data.joint_vel[0, joint_index].item())
             computed_torque = float(robot.data.computed_torque[0, joint_index].item())
             applied_torque = float(robot.data.applied_torque[0, joint_index].item())
             row = {
-                "time_s": sample_time,
+                "time_s": command_time,
                 "phase": phase,
                 "damping_nms_per_rad": damping,
                 "target_rad": target_rad,
@@ -389,6 +389,10 @@ def main() -> None:
             }
             for field, value in row.items():
                 records[damping][field].append(value)
+
+        sim.step()
+        for robot in robots:
+            robot.update(sim_dt)
 
     write_csv(output_dir, records)
     summary = compute_summary(records, baseline_rad)
