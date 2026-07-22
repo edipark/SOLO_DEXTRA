@@ -220,7 +220,7 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     # Set > 0 to activate; start small (e.g. 0.01) and tune up.
     action_rate_penalty_weight: float = 0.5
     # Motion
-    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p5_vel0p4.npz")  # FK motion file (see `motions/create_motion_variant.py`)
+    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p5_vel0p5.npz")  # FK motion file (see `motions/create_motion_variant.py`)
     reference_body = "base_link"
     reset_strategy = "default"  # default, random, random-start
 
@@ -306,5 +306,5 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
 @configclass
 class DextraAmpWalkEnvCfg(DextraAmpEnvCfg):
     """Dextra AMP Walk environment config."""
-    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p5_vel0p4.npz")
+    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p4_vel0p4.npz")
     # motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk.npz")

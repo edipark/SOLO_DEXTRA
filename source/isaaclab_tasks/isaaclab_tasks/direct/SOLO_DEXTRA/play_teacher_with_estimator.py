@@ -73,6 +73,18 @@ parser.add_argument("--action-log-env-id", type=int, default=0,
                     help="Env index to save into --action-log-output")
 parser.add_argument("--replay-action-log", type=str, default=None,
                     help="Replay mode: path to .npz action log created by --action-log-output")
+parser.add_argument(
+    "--plot-joints",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Save per-joint position-command, actual-position, and applied-torque plots (default: enabled)",
+)
+parser.add_argument("--joint-plot-env-id", type=int, default=0,
+                    help="Environment index to visualize with --plot-joints")
+parser.add_argument("--joint-plot-output", type=str, default=None,
+                    help="Joint diagnostics PNG path (auto-selected when omitted)")
+parser.add_argument("--joint-plot-max-steps", type=int, default=6000,
+                    help="Maximum steps retained for joint plots; 0 keeps the full rollout")
 AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(headless=False)
 args_cli, hydra_args = parser.parse_known_args()
@@ -103,6 +115,78 @@ POLICY_DT = (1.0 / 120.0) * 4  # sim dt * decimation = 1/30 s
 EMA_ALPHA = 0.2  # Must match estimator training and SOLO_HW/config.yaml
 
 
+def save_joint_diagnostics_plot(
+    output_path: str,
+    step_dt: float,
+    joint_names: list[str],
+    position_commands: list[np.ndarray],
+    actual_positions: list[np.ndarray],
+    applied_torques: list[np.ndarray],
+) -> None:
+    """Save one subplot per joint with position and applied-torque traces."""
+    if not position_commands:
+        print("[play] WARNING: joint plot enabled but no samples were recorded")
+        return
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        print(f"[play] WARNING: unable to create joint plot (matplotlib unavailable): {exc}")
+        return
+
+    command_np = np.asarray(position_commands, dtype=np.float32)
+    position_np = np.asarray(actual_positions, dtype=np.float32)
+    torque_np = np.asarray(applied_torques, dtype=np.float32)
+    times = np.arange(command_np.shape[0], dtype=np.float32) * float(step_dt)
+
+    num_joints = command_np.shape[1]
+    num_cols = 3
+    num_rows = int(np.ceil(num_joints / num_cols))
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(18, 3.4 * num_rows), sharex=True)
+    axes = np.asarray(axes).reshape(-1)
+
+    legend_handles = None
+    legend_labels = None
+    for joint_id, joint_name in enumerate(joint_names):
+        ax_pos = axes[joint_id]
+        ax_tau = ax_pos.twinx()
+        line_command = ax_pos.plot(
+            times, command_np[:, joint_id], color="tab:blue", linewidth=1.2, label="position command"
+        )[0]
+        line_actual = ax_pos.plot(
+            times, position_np[:, joint_id], color="tab:orange", linewidth=1.1, label="actual position"
+        )[0]
+        line_torque = ax_tau.plot(
+            times, torque_np[:, joint_id], color="tab:red", linewidth=0.9, alpha=0.65, label="applied torque"
+        )[0]
+        ax_pos.set_title(joint_name, fontsize=10)
+        ax_pos.set_ylabel("position [rad]")
+        ax_tau.set_ylabel("torque [N m]", color="tab:red")
+        ax_tau.tick_params(axis="y", colors="tab:red")
+        ax_pos.grid(True, alpha=0.25)
+        if legend_handles is None:
+            legend_handles = [line_command, line_actual, line_torque]
+            legend_labels = [line.get_label() for line in legend_handles]
+
+    for axis in axes[num_joints:]:
+        axis.set_visible(False)
+    for axis in axes[max(0, num_joints - num_cols):num_joints]:
+        axis.set_xlabel("time [s]")
+
+    fig.suptitle("Joint position tracking and applied torque", fontsize=15)
+    fig.legend(legend_handles, legend_labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 0.975))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    print(f"[play] Joint diagnostics saved to: {output_path}  (steps={command_np.shape[0]})")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -127,6 +211,17 @@ def main() -> None:
 
     csv_output = os.path.abspath(args_cli.csv_output) if args_cli.csv_output else None
     action_log_output = os.path.abspath(args_cli.action_log_output) if args_cli.action_log_output else None
+    if args_cli.joint_plot_max_steps < 0:
+        raise ValueError("--joint-plot-max-steps must be >= 0")
+
+    joint_plot_output = None
+    if args_cli.plot_joints:
+        if args_cli.joint_plot_output:
+            joint_plot_output = os.path.abspath(args_cli.joint_plot_output)
+        else:
+            plot_anchor = action_log_output or csv_output or replay_action_path or estimator_path
+            plot_dir = os.path.dirname(plot_anchor) if plot_anchor else os.getcwd()
+            joint_plot_output = os.path.join(plot_dir, "joint_diagnostics.png")
 
     # --- environment ---
     from isaaclab_tasks.direct.SOLO_DEXTRA.dextra_amp_env_cfg import DextraAmpWalkEnvCfg
@@ -171,6 +266,21 @@ def main() -> None:
     device = obs.device
     num_envs = obs.shape[0]
     print(f"[play] Environment device: {device}, num_envs: {num_envs}")
+
+    robot = env.unwrapped.robot
+    joint_names = list(robot.joint_names)
+    joint_plot_env_id = int(args_cli.joint_plot_env_id)
+    if args_cli.plot_joints and (joint_plot_env_id < 0 or joint_plot_env_id >= num_envs):
+        raise ValueError(f"--joint-plot-env-id must be in [0, {num_envs - 1}], got {joint_plot_env_id}")
+    joint_position_commands: list[np.ndarray] = []
+    joint_actual_positions: list[np.ndarray] = []
+    joint_applied_torques: list[np.ndarray] = []
+    if args_cli.plot_joints:
+        max_steps_text = "unlimited" if args_cli.joint_plot_max_steps == 0 else str(args_cli.joint_plot_max_steps)
+        print(
+            f"[play] Joint plotting enabled: {joint_plot_output} "
+            f"(env_id={joint_plot_env_id}, max_steps={max_steps_text})"
+        )
 
     csv_writer = None
     csv_file = None
@@ -309,6 +419,24 @@ def main() -> None:
         raw_obs, _, terminated, truncated, _ = env.step(action)
         obs = unwrap_obs(raw_obs)
 
+        should_record_joint_plot = (
+            args_cli.plot_joints
+            and (
+                args_cli.joint_plot_max_steps == 0
+                or len(joint_position_commands) < args_cli.joint_plot_max_steps
+            )
+        )
+        if should_record_joint_plot:
+            joint_position_commands.append(
+                robot.data.joint_pos_target[joint_plot_env_id].detach().to(torch.float32).cpu().numpy().copy()
+            )
+            joint_actual_positions.append(
+                robot.data.joint_pos[joint_plot_env_id].detach().to(torch.float32).cpu().numpy().copy()
+            )
+            joint_applied_torques.append(
+                robot.data.applied_torque[joint_plot_env_id].detach().to(torch.float32).cpu().numpy().copy()
+            )
+
         reset_mask = (terminated | truncated).squeeze(-1) if terminated.dim() > 1 else (terminated | truncated)
         if (not replay_mode) and reset_mask.any():
             with torch.inference_mode():
@@ -331,6 +459,15 @@ def main() -> None:
                 time.sleep(sleep)
 
     env.close()
+    if args_cli.plot_joints:
+        save_joint_diagnostics_plot(
+            joint_plot_output,
+            dt,
+            joint_names,
+            joint_position_commands,
+            joint_actual_positions,
+            joint_applied_torques,
+        )
     if csv_file is not None:
         csv_file.close()
     if action_log_output is not None:

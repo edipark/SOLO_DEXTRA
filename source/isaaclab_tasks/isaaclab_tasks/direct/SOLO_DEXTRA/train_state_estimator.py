@@ -27,6 +27,7 @@ Usage (from repo root)::
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import sys
 import os
 import json
@@ -123,6 +124,87 @@ from solo_models import (
 )
 
 
+def _unwrap_direct_env(env):
+    """Return the DirectRLEnv below Gym/SKRL wrappers."""
+    current = env
+    for _ in range(32):
+        if hasattr(current, "event_manager") and hasattr(current, "scene"):
+            return current
+        next_env = getattr(current, "_env", None)
+        if next_env is None:
+            next_env = getattr(current, "unwrapped", None)
+        if next_env is None or next_env is current:
+            break
+        current = next_env
+    raise RuntimeError("Unable to unwrap DirectRLEnv")
+
+
+def _move_startup_events_to_dagger_mode(events_cfg) -> list[str]:
+    """Prevent automatic startup DR and expose it as an explicit DAgger mode."""
+    moved = []
+    for name in dir(events_cfg):
+        if name.startswith("_"):
+            continue
+        term = getattr(events_cfg, name)
+        if getattr(term, "mode", None) == "startup":
+            term.mode = "dagger_dr"
+            moved.append(name)
+    return moved
+
+
+def _snapshot_nominal_dynamics(env):
+    """Snapshot the clean environment before the first DAgger round."""
+    core_env = _unwrap_direct_env(env)
+    asset = core_env.scene["robot"]
+    core_env._estimator_nominal_dynamics = {
+        "materials": asset.root_physx_view.get_material_properties().clone(),
+        "masses": asset.root_physx_view.get_masses().clone(),
+        "inertias": asset.root_physx_view.get_inertias().clone(),
+        "joint_armature": asset.data.joint_armature.clone(),
+        "actuators": {
+            name: {
+                "damping": actuator.damping.clone(),
+                "effort_limit": actuator.effort_limit.clone(),
+                "punch_torque": getattr(actuator, "_punch_torque", None).clone()
+                if hasattr(actuator, "_punch_torque") else None,
+            }
+            for name, actuator in asset.actuators.items()
+        },
+        "joint_velocity_noise_cfg": getattr(core_env, "_joint_velocity_observation_noise_cfg", None),
+    }
+
+
+def _restore_nominal_dynamics(core_env):
+    """Restore clean dynamics after a DAgger collection rollout."""
+    asset = core_env.scene["robot"]
+    snapshot = core_env._estimator_nominal_dynamics
+    physx_env_ids = asset._ALL_INDICES.cpu()
+    asset.root_physx_view.set_material_properties(snapshot["materials"], physx_env_ids)
+    asset.root_physx_view.set_masses(snapshot["masses"], physx_env_ids)
+    asset.root_physx_view.set_inertias(snapshot["inertias"], physx_env_ids)
+    asset.write_joint_armature_to_sim(snapshot["joint_armature"])
+    for name, state in snapshot["actuators"].items():
+        actuator = asset.actuators[name]
+        actuator.damping[:] = state["damping"]
+        actuator.effort_limit[:] = state["effort_limit"]
+        if state["punch_torque"] is not None:
+            actuator._punch_torque[:] = state["punch_torque"]
+    core_env._joint_velocity_observation_noise_cfg = snapshot["joint_velocity_noise_cfg"]
+    if hasattr(core_env, "_ax18a_effort_limit_ratio"):
+        core_env._ax18a_effort_limit_ratio.fill_(float(core_env.cfg.effort_limit_ratio))
+
+
+@contextmanager
+def dagger_domain_randomization(env):
+    """Enable physical DR only while collecting a DAgger round."""
+    core_env = _unwrap_direct_env(env)
+    core_env.event_manager.apply(mode="dagger_dr")
+    try:
+        yield
+    finally:
+        _restore_nominal_dynamics(core_env)
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -139,8 +221,7 @@ def main(env_cfg, experiment_cfg):
 
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = device
-    # Keep DextraEventCfg enabled so estimator collection and DAgger rollouts
-    # cover the same randomized physical dynamics used during AMP training.
+    dagger_dr_terms = _move_startup_events_to_dagger_mode(env_cfg.events)
     env_cfg.termination_min_vel_x = 0.0  # 속도 terminate 비활성화 (estimator warm-up 보호)
     env_cfg.vel_window_min_vx = 0.0      # windowed 속도 terminate도 비활성화
 
@@ -166,6 +247,8 @@ def main(env_cfg, experiment_cfg):
     print("\n[Setup] Environment")
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = SkrlVecEnvWrapper(env, ml_framework="torch")
+    _snapshot_nominal_dynamics(env)
+    print(f"  DAgger-only DR terms: {', '.join(dagger_dr_terms)}")
 
     experiment_cfg["trainer"]["close_environment_at_exit"] = False
     experiment_cfg["agent"]["experiment"]["write_interval"] = 0
@@ -321,11 +404,12 @@ def main(env_cfg, experiment_cfg):
                 est_ratio = 1.0
 
             # 새 데이터 수집 (estimator 사용)
-            new_h, new_p, new_s, c_stats = collector.collect_with_estimator(
-                env, teacher, estimator, args_cli.collect_steps,
-                est_ratio=est_ratio, noise=0.01,
-                use_mlp=use_mlp,
-            )
+            with dagger_domain_randomization(env):
+                new_h, new_p, new_s, c_stats = collector.collect_with_estimator(
+                    env, teacher, estimator, args_cli.collect_steps,
+                    est_ratio=est_ratio, noise=0.01,
+                    use_mlp=use_mlp,
+                )
 
             if new_h is not None:
                 histories = torch.cat([histories, new_h])

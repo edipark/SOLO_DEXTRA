@@ -89,7 +89,7 @@ agent:
   clip_predicted_values: True
   
   # Loss scales
-  entropy_loss_scale: 0.01
+  entropy_loss_scale: 0.003
   value_loss_scale: 2.5
   discriminator_loss_scale: 6.0
   
