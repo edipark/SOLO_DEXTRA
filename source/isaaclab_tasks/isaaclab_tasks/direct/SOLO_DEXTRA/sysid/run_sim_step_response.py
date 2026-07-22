@@ -30,6 +30,8 @@ import csv
 import json
 import math
 import os
+import sys
+import threading
 from datetime import datetime
 
 from isaaclab.app import AppLauncher
@@ -39,7 +41,7 @@ parser = argparse.ArgumentParser(description="Fixed-base AX-18A damping sweep")
 parser.add_argument("--joint-name", type=str, default="L_Thigh_Joint",
                     help="Exact robot joint name to excite")
 parser.add_argument("--damping-values", type=float, nargs="+",
-                    default=[0.03, 0.05, 0.08, 0.12, 0.177],
+                    default=[0.03, 0.031, 0.032, 0.033, 0.034, 0.035, 0.036, 0.037, 0.038, 0.039, 0.04],
                     help="Actuator damping values [N m s/rad]")
 parser.add_argument("--step-deg", type=float, default=5.0,
                     help="Positive and negative target step magnitude [deg]")
@@ -100,6 +102,7 @@ from isaaclab_tasks.direct.SOLO_DEXTRA.dextra_robot_cfg import DEXTRA_CFG
 
 
 AX18A_RAD_PER_TICK = math.radians(0.29)
+_active_sim: SimulationContext | None = None
 
 
 def validate_args() -> None:
@@ -244,47 +247,84 @@ def save_plot(output_dir: str, records: dict[float, dict[str, list]], segments: 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
-    colors = plt.get_cmap("tab10")(np.linspace(0.0, 1.0, len(args_cli.damping_values)))
+    damping_count = len(args_cli.damping_values)
+    fig = plt.figure(figsize=(18, 3.8 * damping_count), constrained_layout=True)
+    subfigures = fig.subfigures(nrows=damping_count, ncols=1, squeeze=False)
 
-    reference = records[args_cli.damping_values[0]]
-    time_s = np.asarray(reference["time_s"])
-    axes[0].step(time_s, reference["target_rad"], where="post", color="black", linewidth=2.0,
-                 linestyle="--", label="position command")
-
-    for color, damping in zip(colors, args_cli.damping_values):
+    for row_index, damping in enumerate(args_cli.damping_values):
         data = records[damping]
-        label = f"damping={damping:g}"
-        axes[0].plot(data["time_s"], data["position_rad"], color=color, linewidth=1.4, label=label)
-        axes[1].plot(data["time_s"], data["velocity_rad_s"], color=color, linewidth=1.2, label=label)
-        axes[2].plot(data["time_s"], data["applied_torque_nm"], color=color, linewidth=1.1, label=label)
+        time_s = np.asarray(data["time_s"])
+        subfigure = subfigures[row_index, 0]
+        subfigure.suptitle(f"damping = {damping:g} N m s/rad", fontsize=12, fontweight="bold")
+        axes = subfigure.subplots(1, 3, sharex=True)
 
-    axes[2].axhline(+effort_limit, color="black", linestyle=":", linewidth=1.0,
-                    label=f"compliance effort limit ±{effort_limit:.3f} N m")
-    axes[2].axhline(-effort_limit, color="black", linestyle=":", linewidth=1.0)
+        axes[0].step(
+            time_s, data["target_rad"], where="post", color="black", linewidth=1.8, linestyle="--"
+        )
+        axes[0].plot(time_s, data["position_rad"], color="tab:blue", linewidth=1.4)
+        axes[1].plot(time_s, data["velocity_rad_s"], color="tab:orange", linewidth=1.2)
+        axes[2].plot(time_s, data["applied_torque_nm"], color="tab:red", linewidth=1.1)
+        axes[2].axhline(+effort_limit, color="black", linestyle=":", linewidth=1.0)
+        axes[2].axhline(-effort_limit, color="black", linestyle=":", linewidth=1.0)
 
-    for axis in axes:
-        for segment in segments[1:]:
-            axis.axvline(segment["start_s"], color="gray", linewidth=0.8, alpha=0.45)
-        axis.grid(True, alpha=0.25)
-    axes[0].set_ylabel("position [rad]")
-    axes[1].set_ylabel("velocity [rad/s]")
-    axes[2].set_ylabel("applied torque [N m]")
-    axes[2].set_xlabel("time [s]")
-    axes[0].legend(ncol=3, fontsize=9)
-    axes[1].legend(ncol=3, fontsize=9)
-    axes[2].legend(ncol=3, fontsize=9)
+        axes[0].set_title("Position: command (black dashed), response (blue)", fontsize=10)
+        axes[1].set_title("Joint velocity", fontsize=10)
+        axes[2].set_title(f"Applied torque: effort limit ±{effort_limit:.3f} N m (dotted)", fontsize=10)
+        axes[0].set_ylabel("position [rad]")
+        axes[1].set_ylabel("velocity [rad/s]")
+        axes[2].set_ylabel("torque [N m]")
+
+        for axis in axes:
+            for segment in segments[1:]:
+                axis.axvline(segment["start_s"], color="gray", linewidth=0.8, alpha=0.45)
+            axis.set_xlabel("time [s]")
+            axis.grid(True, alpha=0.25)
+
     fig.suptitle(
         f"Fixed-base AX-18A step response — {args_cli.joint_name}, ±{args_cli.step_deg:g}°, "
         f"torque ratio={args_cli.torque_limit_ratio:g}",
         fontsize=14,
     )
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     fig.savefig(os.path.join(output_dir, "step_response.png"), dpi=170)
     plt.close(fig)
 
 
+def _close_simulation_resources() -> None:
+    """Release the raw simulation context and close Kit."""
+    global _active_sim
+
+    if _active_sim is not None:
+        try:
+            if not _active_sim.has_gui():
+                _active_sim.stop()
+            _active_sim.clear_all_callbacks()
+            _active_sim.clear_instance()
+        except Exception as error:
+            print(f"[sysid-sim] WARNING: SimulationContext cleanup failed: {error}")
+        finally:
+            _active_sim = None
+
+    try:
+        simulation_app.close()
+    except Exception as error:
+        print(f"[sysid-sim] WARNING: Kit cleanup failed: {error}")
+
+
+def shutdown_simulation(exit_code: int) -> None:
+    """Bound the entire native cleanup sequence, including sim.stop()."""
+    cleanup_thread = threading.Thread(target=_close_simulation_resources, daemon=True)
+    cleanup_thread.start()
+    cleanup_thread.join(timeout=15.0)
+    if cleanup_thread.is_alive():
+        print("[sysid-sim] WARNING: simulation shutdown timed out; forcing process exit")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
+
+
 def main() -> None:
+    global _active_sim
+
     validate_args()
     output_dir = create_output_dir()
     sim_dt = 1.0 / args_cli.physics_hz
@@ -300,6 +340,7 @@ def main() -> None:
         ),
     )
     sim = SimulationContext(sim_cfg)
+    _active_sim = sim
     sim.set_camera_view(eye=[2.2, 2.0, 1.4], target=[0.0, 0.0, args_cli.base_height - 0.15])
 
     ground_cfg = sim_utils.GroundPlaneCfg()
@@ -436,4 +477,4 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        simulation_app.close()
+        shutdown_simulation(exit_code=1 if sys.exc_info()[0] is not None else 0)
