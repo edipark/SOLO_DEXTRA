@@ -1,0 +1,10 @@
+{
+  "result": "completed",
+  "sample_count": 642,
+  "valid_position_count": 642,
+  "deadline_miss_count": 0,
+  "mean_sample_duration_ms": 1.943887749179923,
+  "max_sample_duration_ms": 3.01046800086624,
+  "position_rmse_rad": 0.0177891327393228,
+  "max_abs_velocity_rad_s": 2.2750204331055026
+}

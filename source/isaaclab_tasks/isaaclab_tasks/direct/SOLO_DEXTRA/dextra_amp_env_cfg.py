@@ -12,7 +12,14 @@ import torch
 from .dextra_robot_cfg import DEXTRA_CFG
 
 from isaaclab.actuators import DCMotorCfg, ImplicitActuatorCfg
-from .actuators import AX18AActuator, AX18AActuatorCfg
+from .actuators import (
+    AX18AActuator,
+    AX18AActuatorCfg,
+    AX18AHybridActuator,
+    AX18AHybridActuatorCfg,
+    AX18AImplicitActuator,
+    AX18AImplicitActuatorCfg,
+)
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 import isaaclab.envs.mdp as mdp
@@ -36,9 +43,10 @@ def randomize_ax18a_effort_limit(env, env_ids, asset_cfg: SceneEntityCfg):
     """Randomize one AX-18A effort-limit ratio per environment.
 
     Every AX-18A joint in a given environment receives the same sampled ratio,
-    while different environments receive independent ratios. The cached punch
-    torque is updated together with the effort limit so the compliance profile
-    remains consistent with the hardware register model.
+    while different environments receive independent ratios. Both the legacy
+    explicit actuator and PhysX-backed implicit actuators are supported. For
+    implicit actuators, the sampled limit is also written to the PhysX drive
+    so it clips the combined spring and damping torque.
     """
     asset = env.scene[asset_cfg.name]
     if env_ids is None:
@@ -57,13 +65,21 @@ def randomize_ax18a_effort_limit(env, env_ids, asset_cfg: SceneEntityCfg):
     effort_limits = env.cfg.ax18a_stall_torque * ratios
 
     for actuator in asset.actuators.values():
-        if not isinstance(actuator, AX18AActuator):
+        if not isinstance(actuator, (AX18AActuator, AX18AHybridActuator, AX18AImplicitActuator)):
             continue
         actuator_effort_limits = effort_limits.expand(-1, actuator.num_joints)
         actuator.effort_limit[env_ids] = actuator_effort_limits
-        actuator._punch_torque[env_ids] = (
-            float(actuator.cfg.punch) / 1023.0 * actuator_effort_limits
-        )
+        if isinstance(actuator, (AX18AActuator, AX18AHybridActuator)):
+            actuator._punch_torque[env_ids] = (
+                float(actuator.cfg.punch) / 1023.0 * actuator_effort_limits
+            )
+        if isinstance(actuator, (AX18AHybridActuator, AX18AImplicitActuator)):
+            actuator.effort_limit_sim[env_ids] = actuator_effort_limits
+            asset.write_joint_effort_limit_to_sim(
+                actuator_effort_limits,
+                joint_ids=actuator.joint_indices,
+                env_ids=env_ids,
+            )
 
     # Keep the sampled ratios available for diagnostics and effort-bin eval.
     if not hasattr(env, "_ax18a_effort_limit_ratio"):
@@ -159,8 +175,10 @@ class DextraEventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            # stiffness is a dummy field for AX18AActuator — skip randomization
-            "damping_distribution_params": (0.8, 1.2),  # ±20% back-EMF variation
+            # Randomize stiffness independently from the effort-limit ratio.
+            # These scale ranges are relative to the configured nominal gains.
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.8, 1.2),
             "operation": "scale",
         },
     )
@@ -198,16 +216,16 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     # Termination
     early_termination = True
     termination_height = 0.15   # Base link below 15cm → die
-    termination_min_vel_x: float = 0.0  # Instantaneous vx threshold (0.0 = disabled)
+    termination_min_vel_x: float = 0.0 # Instantaneous vx threshold (0.0 = disabled)
     # termination_min_vel_x: float = 0.0  # Instantaneous vx threshold (disabled; relying on windowed velocity termination instead)
 
-    vel_window_min_vx: float = 0.0   # m/s  (set 0.0 to disable)
-    vel_window_steps: int = 4        # number of control steps to average over (~2s @ 30Hz)
+    vel_window_min_vx: float = 0.01  # m/s  (set 0.0 to disable)
+    vel_window_steps: int = 10        # number of control steps to average over (~2s @ 30Hz)
 
     # Task reward: world +X linear velocity tracking (see `_get_rewards` in dextra_amp_env.py).
     # Requires `task_reward_weight > 0` in `agents/skrl_amp_cfg.yaml` to affect learning.
-    target_vel_x_world: float = 0.1 / motion_speed_scale           # m/s desired along world +X
-    target_vel_tracking_coeff: float = 200.0   # exp(-coeff * (vx - target)^2); larger = sharper peak
+    target_vel_x_world: float = 0.08 / motion_speed_scale           # m/s desired along world +X
+    target_vel_tracking_coeff: float = 2.0   # exp(-coeff * (vx - target)^2); larger = sharper peak
     vel_reward_weight: float = 0.5            # weight within combined task reward
 
     # Foot-flat reward: penalizes feet tilting away from ground-parallel.
@@ -218,9 +236,13 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
     # Action-rate penalty: penalizes rapid target changes between consecutive steps.
     # Reduces joint jittering. Penalty = mean(||a_t - a_{t-1}||^2) across joints.
     # Set > 0 to activate; start small (e.g. 0.01) and tune up.
-    action_rate_penalty_weight: float = 0.5
+    action_rate_penalty_weight: float = 0.05
+
+    # Huber penalty on normalized torque-limit excess. Quadratic near the
+    # saturation boundary and linear for severe torque demands.
+    saturation_penalty_weight: float = 0.05
     # Motion
-    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p5_vel0p5.npz")  # FK motion file (see `motions/create_motion_variant.py`)
+    motion_file: str = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_1p5x_slower_stride0p5_vel0p5.npz")  # FK motion file (see `motions/create_motion_variant.py`)
     reference_body = "base_link"
     reset_strategy = "default"  # default, random, random-start
 
@@ -243,23 +265,62 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
 
     # Robot
     # -------------------------------------------------------------------------
-    # AX18AActuator: Dynamixel AX-18A compliance model.
-    # Compliance slope=64 → slope width ≈ 0.324 rad and effective stiffness ≈ 5.3 N·m/rad.
+    # AX18AImplicitActuator: thin position-dead-zone wrapper around the PhysX
+    # implicit PD drive. Stiffness and damping are the actual drive gains, and
+    # effort_limit_sim clips their combined torque.
     # -------------------------------------------------------------------------
     robot: ArticulationCfg = DEXTRA_CFG.replace(prim_path="/World/envs/env_.*/Robot").replace(
         actuators={
-            "legs": AX18AActuatorCfg(
+            "legs": AX18AImplicitActuatorCfg(
                 joint_names_expr=[".*HipYaw.*", ".*HipRoll.*", ".*Thigh.*", ".*Calf.*", ".*Ankle.*"],
-                stall_torque=ax18a_stall_torque,  # AX-18A physical motor limit [N·m] (fixed, spec)
-                effort_limit=ax18a_stall_torque * effort_limit_ratio,
-                velocity_limit=10.16,    # AX-18A no-load speed [rad/s]
-                damping=0.177,           # back-EMF: τ_stall / ω_no_load = 1.8 / 10.16 or 0.035
-                armature=0.00054,        # rotor inertia reflected to joint [kg·m²]
-                friction=0.0,           # PhysX static friction coefficient. set 0.0 to prevent discontinuities with the AX-18A compliance model
-                compliance_slope=64.0,   # AX-18A register slope; deploy writes the same value on connect
+                stiffness=5.4,         # actual PhysX position gain [N m/rad]
+                damping=0.4,            # actual PhysX velocity gain [N m s/rad]
+                effort_limit_sim=ax18a_stall_torque * effort_limit_ratio,
+                velocity_limit_sim=10.16,
+                armature=0.00054,
+                friction=0.0,
+                dead_zone=0.29 * (3.14159265358979 / 180.0),
             ),
         },
     )
+    # -------------------------------------------------------------------------
+    # [AX18AHybridActuator] Non-linear compliance/punch shaping converted to
+    # an equivalent PhysX implicit-drive target. Preserved for A/B comparison
+    # and rollback.
+    # -------------------------------------------------------------------------
+    # robot: ArticulationCfg = DEXTRA_CFG.replace(prim_path="/World/envs/env_.*/Robot").replace(
+    #     actuators={
+    #         "legs": AX18AHybridActuatorCfg(
+    #             joint_names_expr=[".*HipYaw.*", ".*HipRoll.*", ".*Thigh.*", ".*Calf.*", ".*Ankle.*"],
+    #             stiffness=1.62,
+    #             damping=0.4,
+    #             stall_torque=ax18a_stall_torque,
+    #             effort_limit_sim=ax18a_stall_torque * effort_limit_ratio,
+    #             velocity_limit_sim=10.16,
+    #             armature=0.00054,
+    #             friction=0.0,
+    #             compliance_slope=64.0,
+    #         ),
+    #     },
+    # )
+    # -------------------------------------------------------------------------
+    # [Legacy AX18AActuator] Explicit compliance + explicit damping model.
+    # Preserved for direct A/B comparison and rollback.
+    # -------------------------------------------------------------------------
+    # robot: ArticulationCfg = DEXTRA_CFG.replace(prim_path="/World/envs/env_.*/Robot").replace(
+    #     actuators={
+    #         "legs": AX18AActuatorCfg(
+    #             joint_names_expr=[".*HipYaw.*", ".*HipRoll.*", ".*Thigh.*", ".*Calf.*", ".*Ankle.*"],
+    #             stall_torque=ax18a_stall_torque,
+    #             effort_limit=ax18a_stall_torque * effort_limit_ratio,
+    #             velocity_limit=10.16,
+    #             damping=0.177,
+    #             armature=0.00054,
+    #             friction=0.0,
+    #             compliance_slope=64.0,
+    #         ),
+    #     },
+    # )
     # -------------------------------------------------------------------------
     # [ImplicitActuator] PD handled by PhysX (continuous-time).
     # Faster training convergence; less accurate sim-to-real.
@@ -306,5 +367,5 @@ class DextraAmpEnvCfg(DirectRLEnvCfg):
 @configclass
 class DextraAmpWalkEnvCfg(DextraAmpEnvCfg):
     """Dextra AMP Walk environment config."""
-    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_stride0p4_vel0p4.npz")
+    motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk_30hz_1p5x_slower_stride0p5_vel0p5.npz")
     # motion_file = os.path.join(MOTIONS_DIR, "dextra_walk_flat_pitch_fk.npz")

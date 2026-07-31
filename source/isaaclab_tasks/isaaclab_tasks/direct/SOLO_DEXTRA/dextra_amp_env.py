@@ -320,6 +320,29 @@ class DextraAmpEnv(DirectRLEnv):
         else:
             action_rate_penalty = torch.zeros(self.num_envs, device=self.device)
 
+        # --- actuator saturation penalty ---
+        # Normalize clipping excess by the per-joint limit so effort-limit DR
+        # does not change the scale. Huber shaping remains sensitive to severe
+        # saturation while growing only linearly for large torque demands.
+        effort_limit = self.robot.data.joint_effort_limits.clamp_min(1.0e-6)
+        if self.cfg.saturation_penalty_weight > 0.0:
+            excess_ratio = (
+                torch.abs(self.robot.data.computed_torque) / effort_limit - 1.0
+            ).clamp_min(0.0)
+            huber_excess = torch.where(
+                excess_ratio <= 1.0,
+                0.5 * excess_ratio.square(),
+                excess_ratio - 0.5,
+            )
+            saturation_penalty = huber_excess.mean(dim=-1)
+            combined = combined - self.cfg.saturation_penalty_weight * saturation_penalty
+        else:
+            saturation_penalty = torch.zeros(self.num_envs, device=self.device)
+
+        saturation_fraction = (
+            torch.abs(self.robot.data.computed_torque) >= effort_limit - 1.0e-5
+        ).to(dtype=torch.float32).mean(dim=-1)
+
         # --- TensorBoard (SKRL): trainer only logs infos["log"] values that are scalar tensors ---
         prev_log = self.extras.get("log") if isinstance(self.extras.get("log"), dict) else {}
         self.extras["log"] = {
@@ -328,9 +351,14 @@ class DextraAmpEnv(DirectRLEnv):
             "reward/foot_flat": foot_flat_reward.mean().detach(),
             "reward/task_combined": combined.mean().detach(),
             "reward/action_rate_penalty": action_rate_penalty.mean().detach(),
+            "reward/saturation_penalty": saturation_penalty.mean().detach(),
+            "reward/saturation_penalty_weighted": (
+                self.cfg.saturation_penalty_weight * saturation_penalty.mean()
+            ).detach(),
             "metric/base_vel_x": vx.mean().detach(),
             "metric/foot_dot_z": dot.mean().detach(),
             "metric/base_height": self.robot.data.body_pos_w[:, self.ref_body_index, 2].mean().detach(),
+            "metric/torque_saturation_fraction": saturation_fraction.mean().detach(),
         }
 
         return combined

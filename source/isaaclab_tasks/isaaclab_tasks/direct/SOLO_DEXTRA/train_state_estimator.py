@@ -90,6 +90,8 @@ parser.add_argument("--eval_episodes", type=int, default=200,
                     help="Episodes per evaluation")
 parser.add_argument("--max_episode_steps", type=int, default=1000,
                     help="Max steps per episode before timeout")
+parser.add_argument("--robust_eval_seed_offset", type=int, default=10000,
+                    help="Seed offset for the fixed held-out DR evaluation")
 
 # Seed
 parser.add_argument("--seed", type=int, default=42)
@@ -165,6 +167,7 @@ def _snapshot_nominal_dynamics(env):
             name: {
                 "damping": actuator.damping.clone(),
                 "effort_limit": actuator.effort_limit.clone(),
+                "effort_limit_sim": actuator.effort_limit_sim.clone(),
                 "punch_torque": getattr(actuator, "_punch_torque", None).clone()
                 if hasattr(actuator, "_punch_torque") else None,
             }
@@ -187,8 +190,18 @@ def _restore_nominal_dynamics(core_env):
         actuator = asset.actuators[name]
         actuator.damping[:] = state["damping"]
         actuator.effort_limit[:] = state["effort_limit"]
+        actuator.effort_limit_sim[:] = state["effort_limit_sim"]
         if state["punch_torque"] is not None:
             actuator._punch_torque[:] = state["punch_torque"]
+        if actuator.is_implicit_model:
+            asset.write_joint_damping_to_sim(
+                actuator.damping,
+                joint_ids=actuator.joint_indices,
+            )
+            asset.write_joint_effort_limit_to_sim(
+                actuator.effort_limit_sim,
+                joint_ids=actuator.joint_indices,
+            )
     core_env._joint_velocity_observation_noise_cfg = snapshot["joint_velocity_noise_cfg"]
     if hasattr(core_env, "_ax18a_effort_limit_ratio"):
         core_env._ax18a_effort_limit_ratio.fill_(float(core_env.cfg.effort_limit_ratio))
@@ -203,6 +216,28 @@ def dagger_domain_randomization(env):
         yield
     finally:
         _restore_nominal_dynamics(core_env)
+
+
+def evaluate_clean_and_dr(env, evaluator, teacher, estimator, num_episodes,
+                          seed, robust_seed_offset, use_mlp=False):
+    """Evaluate one checkpoint in both clean and fixed held-out DR environments."""
+    clean_result = evaluator.evaluate_with_estimator(
+        env, teacher, estimator, num_episodes,
+        seed=seed, use_mlp=use_mlp,
+    )
+
+    # Seed before applying the event terms so every round receives the same
+    # per-environment DR samples. The evaluator also uses this seed for reset.
+    robust_seed = seed + robust_seed_offset
+    torch.manual_seed(robust_seed)
+    np.random.seed(robust_seed)
+    with dagger_domain_randomization(env):
+        dr_result = evaluator.evaluate_with_estimator(
+            env, teacher, estimator, num_episodes,
+            seed=robust_seed, use_mlp=use_mlp,
+        )
+
+    return clean_result, dr_result
 
 
 # ============================================================================
@@ -308,6 +343,7 @@ def main(env_cfg, experiment_cfg):
         "noise_levels": args_cli.noise_levels,
         "eval_episodes": args_cli.eval_episodes,
         "max_episode_steps": args_cli.max_episode_steps,
+        "robust_eval_seed_offset": args_cli.robust_eval_seed_offset,
         "seed": args_cli.seed,
         "teacher_checkpoint": args_cli.teacher_checkpoint,
     }
@@ -361,20 +397,39 @@ def main(env_cfg, experiment_cfg):
         epochs=args_cli.epochs, lr=args_cli.lr, batch_size=args_cli.batch_size,
     )
 
-    # 초기 평가
-    result = evaluator.evaluate_with_estimator(
-        env, teacher, estimator, args_cli.eval_episodes,
-        seed=args_cli.seed, use_mlp=use_mlp,
+    # 초기 clean / held-out DR 평가
+    clean_result, dr_result = evaluate_clean_and_dr(
+        env, evaluator, teacher, estimator, args_cli.eval_episodes,
+        seed=args_cli.seed,
+        robust_seed_offset=args_cli.robust_eval_seed_offset,
+        use_mlp=use_mlp,
     )
-    print(f"  Round 0: episode={result['avg_episode']:.1f}, "
-          f"death={result['death_rate']:.1f}%, timeout={result['timeout_rate']:.1f}%")
+    print(f"  Round 0 Clean: episode={clean_result['avg_episode']:.1f}, "
+          f"death={clean_result['death_rate']:.1f}%, "
+          f"timeout={clean_result['timeout_rate']:.1f}%")
+    print(f"  Round 0 DR:    episode={dr_result['avg_episode']:.1f}, "
+          f"death={dr_result['death_rate']:.1f}%, "
+          f"timeout={dr_result['timeout_rate']:.1f}%")
 
     model_saver.save_estimator(estimator, est_type, args_cli.seed, 0, window,
-                               {"avg_episode": result["avg_episode"],
-                                "death_rate": result["death_rate"]})
+                               {"avg_episode": clean_result["avg_episode"],
+                                "death_rate": clean_result["death_rate"],
+                                "clean_avg_episode": clean_result["avg_episode"],
+                                "clean_death_rate": clean_result["death_rate"],
+                                "dr_avg_episode": dr_result["avg_episode"],
+                                "dr_death_rate": dr_result["death_rate"],
+                                "pareto_best": True})
 
-    training_log = [{"round": 0, **result}]
-    best_episode = result["avg_episode"]
+    training_log = [{
+        "round": 0,
+        **clean_result,
+        "clean": clean_result,
+        "dr": dr_result,
+        "pareto_best": True,
+    }]
+    best_clean_episode = clean_result["avg_episode"]
+    best_dr_episode = dr_result["avg_episode"]
+    best_round = 0
     best_state = {k: v.cpu().clone() for k, v in estimator.state_dict().items()}
 
     # ==================================================================
@@ -436,23 +491,54 @@ def main(env_cfg, experiment_cfg):
                 batch_size=args_cli.batch_size, verbose=False,
             )
 
-            # 평가
-            result = evaluator.evaluate_with_estimator(
-                env, teacher, estimator, args_cli.eval_episodes,
-                seed=args_cli.seed, use_mlp=use_mlp,
+            # Clean과 고정된 held-out DR 조건에서 모두 평가
+            clean_result, dr_result = evaluate_clean_and_dr(
+                env, evaluator, teacher, estimator, args_cli.eval_episodes,
+                seed=args_cli.seed,
+                robust_seed_offset=args_cli.robust_eval_seed_offset,
+                use_mlp=use_mlp,
             )
-            print(f"    Result: episode={result['avg_episode']:.1f}, "
-                  f"death={result['death_rate']:.1f}%, timeout={result['timeout_rate']:.1f}%")
+            print(f"    Clean: episode={clean_result['avg_episode']:.1f}, "
+                  f"death={clean_result['death_rate']:.1f}%, "
+                  f"timeout={clean_result['timeout_rate']:.1f}%")
+            print(f"    DR:    episode={dr_result['avg_episode']:.1f}, "
+                  f"death={dr_result['death_rate']:.1f}%, "
+                  f"timeout={dr_result['timeout_rate']:.1f}%")
+
+            clean_episode = clean_result["avg_episode"]
+            dr_episode = dr_result["avg_episode"]
+            clean_improved = clean_episode > best_clean_episode
+            clean_not_worse = clean_episode >= best_clean_episode
+            dr_improved = dr_episode > best_dr_episode
+            dr_not_worse = dr_episode >= best_dr_episode
+            pareto_updated = (
+                (clean_improved and dr_not_worse)
+                or (dr_improved and clean_not_worse)
+            )
+
+            if pareto_updated:
+                best_clean_episode = clean_episode
+                best_dr_episode = dr_episode
+                best_round = rd
+                best_state = {k: v.cpu().clone() for k, v in estimator.state_dict().items()}
+                print(f"    ★ New Pareto best: clean={best_clean_episode:.1f}, "
+                      f"DR={best_dr_episode:.1f}")
 
             model_saver.save_estimator(estimator, est_type, args_cli.seed, rd, window,
-                                       {"avg_episode": result["avg_episode"],
-                                        "death_rate": result["death_rate"]})
-            training_log.append({"round": rd, **result})
-
-            if result["avg_episode"] > best_episode:
-                best_episode = result["avg_episode"]
-                best_state = {k: v.cpu().clone() for k, v in estimator.state_dict().items()}
-                print(f"    ★ New best: {best_episode:.1f}")
+                                       {"avg_episode": clean_result["avg_episode"],
+                                        "death_rate": clean_result["death_rate"],
+                                        "clean_avg_episode": clean_result["avg_episode"],
+                                        "clean_death_rate": clean_result["death_rate"],
+                                        "dr_avg_episode": dr_result["avg_episode"],
+                                        "dr_death_rate": dr_result["death_rate"],
+                                        "pareto_best": pareto_updated})
+            training_log.append({
+                "round": rd,
+                **clean_result,
+                "clean": clean_result,
+                "dr": dr_result,
+                "pareto_best": pareto_updated,
+            })
 
         # Restore best
         estimator.load_state_dict(best_state)
@@ -466,7 +552,12 @@ def main(env_cfg, experiment_cfg):
         "estimator_state_dict": estimator.state_dict(),
         "estimator_config": estimator.get_config(),
         "window": window,
-        "best_episode": best_episode,
+        # Keep best_episode for compatibility with existing play/deploy code.
+        "best_episode": best_clean_episode,
+        "best_clean_episode": best_clean_episode,
+        "best_dr_episode": best_dr_episode,
+        "best_round": best_round,
+        "selection": "pareto_clean_dr",
         "seed": args_cli.seed,
         "teacher_checkpoint": args_cli.teacher_checkpoint,
     }, best_path)
@@ -478,7 +569,8 @@ def main(env_cfg, experiment_cfg):
 
     print("\n" + "=" * 70)
     print("  Training Complete!")
-    print(f"  Best episode length: {best_episode:.1f}")
+    print(f"  Pareto best round: {best_round}")
+    print(f"  Clean / DR episode: {best_clean_episode:.1f} / {best_dr_episode:.1f}")
     print(f"  Best model: {best_path}")
     print(f"  Training log: {log_path}")
     print("=" * 70)

@@ -103,7 +103,6 @@ import random
 import time
 
 import gymnasium as gym
-import numpy as np
 import skrl
 import torch
 from packaging import version
@@ -152,74 +151,6 @@ def _unwrap_env_with_robot(env):
             return None
         e = nu
     return None
-
-def _save_video_rollout_diagnostics(core, samples: dict[str, list], output_dir: str, dt: float):
-    """Save env-0 action-derived position targets and actuator torques."""
-    if not samples["action_raw"]:
-        print("[WARN] Video rollout diagnostics: no samples collected; skipping.")
-        return
-
-    arrays = {key: np.asarray(value) for key, value in samples.items()}
-    arrays["time_s"] = np.arange(1, arrays["action_raw"].shape[0] + 1, dtype=np.float64) * dt
-    joint_names = list(core.robot.data.joint_names)
-    os.makedirs(output_dir, exist_ok=True)
-
-    data_path = os.path.join(output_dir, "rollout_diagnostics_env0.npz")
-    np.savez_compressed(data_path, joint_names=np.asarray(joint_names), **arrays)
-
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        print(f"[WARN] Video rollout diagnostics: plot skipped: {exc}")
-        print(f"[INFO] Saved rollout diagnostic data: {data_path}")
-        return
-
-    time_s = arrays["time_s"]
-    num_joints = len(joint_names)
-    fig, axes = plt.subplots(num_joints, 2, figsize=(18, max(20, 2.5 * num_joints)), sharex=True)
-    if num_joints == 1:
-        axes = np.asarray([axes])
-
-    for joint_id, joint_name in enumerate(joint_names):
-        pos_ax = axes[joint_id, 0]
-        torque_ax = axes[joint_id, 1]
-        pos_ax.plot(time_s, arrays["joint_position"][:, joint_id], color="black", label="actual q")
-        pos_ax.plot(time_s, arrays["position_target"][:, joint_id], color="tab:blue", linestyle="--", label="position target")
-        pos_ax.set_ylabel("position [rad]")
-        pos_ax.set_title(joint_name)
-        pos_ax.grid(alpha=0.25)
-
-        action_ax = pos_ax.twinx()
-        action_ax.plot(time_s, arrays["action_raw"][:, joint_id], color="0.55", linewidth=0.8, alpha=0.65, label="raw action")
-        action_ax.set_ylim(-1.05, 1.05)
-        action_ax.set_ylabel("normalized action", color="0.4")
-
-        torque_ax.plot(time_s, arrays["computed_torque"][:, joint_id], color="tab:orange", alpha=0.8, label="computed torque")
-        torque_ax.plot(time_s, arrays["applied_torque"][:, joint_id], color="tab:red", label="applied torque")
-        torque_ax.plot(time_s, arrays["effort_limit"][:, joint_id], color="0.35", linestyle=":", linewidth=0.9, label="effort limits")
-        torque_ax.plot(time_s, -arrays["effort_limit"][:, joint_id], color="0.35", linestyle=":", linewidth=0.9)
-        torque_ax.set_ylabel("torque [N m]")
-        torque_ax.set_title(f"{joint_name} torque")
-        torque_ax.grid(alpha=0.25)
-
-        if joint_id == 0:
-            pos_lines, pos_labels = pos_ax.get_legend_handles_labels()
-            action_lines, action_labels = action_ax.get_legend_handles_labels()
-            pos_ax.legend(pos_lines + action_lines, pos_labels + action_labels, loc="upper right")
-            torque_ax.legend(loc="upper right")
-
-    axes[-1, 0].set_xlabel("time [s]")
-    axes[-1, 1].set_xlabel("time [s]")
-    fig.suptitle("Video rollout diagnostics: env 0", fontsize=16)
-    fig.tight_layout(rect=(0, 0, 1, 0.995))
-    plot_path = os.path.join(output_dir, "rollout_diagnostics_env0.png")
-    fig.savefig(plot_path, dpi=150)
-    plt.close(fig)
-    print(f"[INFO] Saved rollout diagnostic plot: {plot_path}")
-    print(f"[INFO] Saved rollout diagnostic data: {data_path}")
 
 
 # config shortcuts
@@ -319,28 +250,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # set agent to evaluation mode
     runner.agent.set_running_mode("eval")
 
-    video_diagnostic_core = None
-    video_diagnostic_samples = None
-    if args_cli.video:
-        video_diagnostic_core = _unwrap_env_with_robot(env_before_skrl)
-        if video_diagnostic_core is None:
-            print("[WARN] Video rollout diagnostics unavailable: no DirectRLEnv-style robot found.")
-        elif not hasattr(video_diagnostic_core, "action_offset") or not hasattr(
-            video_diagnostic_core, "action_scale"
-        ):
-            print("[WARN] Video rollout diagnostics unavailable: action position mapping not found.")
-            video_diagnostic_core = None
-        else:
-            video_diagnostic_samples = {
-                "action_raw": [],
-                "action_clipped": [],
-                "position_target": [],
-                "joint_position": [],
-                "computed_torque": [],
-                "applied_torque": [],
-                "effort_limit": [],
-            }
-
     if args_cli.print_base_velocity:
         _core = _unwrap_env_with_robot(env_before_skrl)
         if _core is None:
@@ -372,33 +281,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             # env stepping
             obs, _, _, _, _ = env.step(actions)
         play_step += 1
-        if video_diagnostic_core is not None and not isinstance(actions, dict):
-            action_env0 = actions[0]
-            if torch.is_tensor(action_env0):
-                action_raw = action_env0.detach().to(dtype=torch.float32).cpu().numpy()
-            else:
-                action_raw = np.asarray(action_env0, dtype=np.float32)
-            action_clipped = np.clip(action_raw, -1.0, 1.0)
-            action_offset = video_diagnostic_core.action_offset.detach().cpu().numpy()
-            action_scale = video_diagnostic_core.action_scale.detach().cpu().numpy()
-            position_target = action_offset + action_scale * action_clipped
-            robot_data = video_diagnostic_core.robot.data
-
-            video_diagnostic_samples["action_raw"].append(action_raw.copy())
-            video_diagnostic_samples["action_clipped"].append(action_clipped.copy())
-            video_diagnostic_samples["position_target"].append(position_target.copy())
-            video_diagnostic_samples["joint_position"].append(
-                robot_data.joint_pos[0].detach().cpu().numpy().copy()
-            )
-            video_diagnostic_samples["computed_torque"].append(
-                robot_data.computed_torque[0].detach().cpu().numpy().copy()
-            )
-            video_diagnostic_samples["applied_torque"].append(
-                robot_data.applied_torque[0].detach().cpu().numpy().copy()
-            )
-            video_diagnostic_samples["effort_limit"].append(
-                robot_data.joint_effort_limits[0].detach().cpu().numpy().copy()
-            )
         if args_cli.print_base_velocity:
             core = _unwrap_env_with_robot(env_before_skrl)
             if core is not None:
@@ -429,14 +311,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
-
-    if args_cli.video and video_diagnostic_core is not None:
-        _save_video_rollout_diagnostics(
-            video_diagnostic_core,
-            video_diagnostic_samples,
-            os.path.join(log_dir, "videos", "play"),
-            dt,
-        )
 
     # close the simulator
     env.close()

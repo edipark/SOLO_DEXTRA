@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Sweep AX-18A damping values in a fixed-base thigh step-response test.
+"""Sweep AX-18A damping values using the active Dextra AMP configuration.
 
-The script creates one complete Dextra robot per damping value. Every robot
-is rigidly fixed at the base and suspended above the ground. All joints hold
-their baseline target while one selected joint receives the same positive and
-negative position steps. No policy, estimator, termination, or domain
+The simulation and robot/actuator configurations are inherited from
+``DextraAmpEnvCfg``.  The only actuator parameter changed by this experiment
+is ``damping``.  One complete robot is created per damping value, rigidly
+fixed at the base and suspended above the ground.  All joints hold their
+baseline target while one selected joint receives the same positive and
+negative position steps.  No policy, estimator, termination, or domain
 randomization is involved.
 
 Outputs are written to a new timestamped directory for every run:
@@ -41,8 +43,8 @@ parser = argparse.ArgumentParser(description="Fixed-base AX-18A damping sweep")
 parser.add_argument("--joint-name", type=str, default="L_Thigh_Joint",
                     help="Exact robot joint name to excite")
 parser.add_argument("--damping-values", type=float, nargs="+",
-                    default=[0.03, 0.031, 0.032, 0.033, 0.034, 0.035, 0.036, 0.037, 0.038, 0.039, 0.04],
-                    help="Actuator damping values [N m s/rad]")
+                    default=None,
+                    help="Actuator damping values [N m s/rad]. Default: 0.5/0.8/1.0/1.2/1.5x AMP nominal")
 parser.add_argument("--step-deg", type=float, default=5.0,
                     help="Positive and negative target step magnitude [deg]")
 parser.add_argument("--baseline-deg", type=float, default=0.0,
@@ -55,26 +57,6 @@ parser.add_argument("--center-hold-s", type=float, default=0.8,
                     help="Baseline hold between the two steps [s]")
 parser.add_argument("--final-hold-s", type=float, default=0.8,
                     help="Final baseline hold after the negative step [s]")
-parser.add_argument("--physics-hz", type=float, default=120.0,
-                    help="Simulation and logging rate [Hz]")
-parser.add_argument("--torque-limit-ratio", type=float, default=0.18,
-                    help="AX-18A Torque Limit register ratio")
-parser.add_argument("--stall-torque", type=float, default=1.8,
-                    help="AX-18A output stall torque [N m]")
-parser.add_argument("--velocity-limit", type=float, default=10.16,
-                    help="AX-18A no-load velocity [rad/s]")
-parser.add_argument("--compliance-margin", type=int, default=1,
-                    help="AX-18A Compliance Margin register value")
-parser.add_argument("--compliance-slope", type=float, default=64.0,
-                    help="AX-18A Compliance Slope register value")
-parser.add_argument("--punch", type=float, default=32.0,
-                    help="AX-18A Punch register value")
-parser.add_argument("--armature", type=float, default=0.00054,
-                    help="Reflected rotor inertia [kg m^2]")
-parser.add_argument("--coulomb-friction", type=float, default=0.04,
-                    help="Explicit gearbox Coulomb friction [N m]")
-parser.add_argument("--viscous-friction", type=float, default=0.0,
-                    help="Additional viscous gearbox friction [N m s/rad]")
 parser.add_argument("--base-height", type=float, default=0.6,
                     help="Fixed base height, chosen to keep both feet airborne [m]")
 parser.add_argument("--robot-spacing", type=float, default=0.55,
@@ -95,14 +77,20 @@ import torch
 import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
 from isaaclab.assets import Articulation
-from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
+from isaaclab.sim import SimulationContext
+from isaaclab.utils import configclass
 
-from isaaclab_tasks.direct.SOLO_DEXTRA.actuators import AX18AActuatorCfg
-from isaaclab_tasks.direct.SOLO_DEXTRA.dextra_robot_cfg import DEXTRA_CFG
+from isaaclab_tasks.direct.SOLO_DEXTRA.dextra_amp_env_cfg import DextraAmpEnvCfg
 
 
-AX18A_RAD_PER_TICK = math.radians(0.29)
 _active_sim: SimulationContext | None = None
+
+
+@configclass
+class DextraAmpStepResponseCfg(DextraAmpEnvCfg):
+    """Step-response config whose dynamics come directly from AMP training."""
+
+    pass
 
 
 def validate_args() -> None:
@@ -114,14 +102,6 @@ def validate_args() -> None:
         raise ValueError("--damping-values must not contain duplicates")
     if args_cli.step_deg <= 0.0:
         raise ValueError("--step-deg must be positive")
-    if args_cli.physics_hz <= 0.0:
-        raise ValueError("--physics-hz must be positive")
-    if not 0.0 < args_cli.torque_limit_ratio <= 1.0:
-        raise ValueError("--torque-limit-ratio must be in (0, 1]")
-    if not 0 <= args_cli.compliance_margin <= 255:
-        raise ValueError("--compliance-margin must be in [0, 255]")
-    if not 1 <= args_cli.compliance_slope <= 254:
-        raise ValueError("--compliance-slope must be in [1, 254]")
     for name in ("settle_s", "step_hold_s", "center_hold_s", "final_hold_s"):
         if getattr(args_cli, name) <= 0.0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
@@ -138,9 +118,9 @@ def create_output_dir() -> str:
     return output_dir
 
 
-def build_robot_cfg(damping: float, robot_index: int) -> object:
-    """Create one fixed-base full robot with the requested damping value."""
-    cfg = copy.deepcopy(DEXTRA_CFG)
+def build_robot_cfg(base_robot_cfg: object, damping: float, robot_index: int) -> object:
+    """Copy the AMP robot config and override only actuator damping."""
+    cfg = copy.deepcopy(base_robot_cfg)
     cfg.prim_path = f"/World/Robot_{robot_index:02d}"
     cfg.spawn.fix_base = True
     cfg.init_state.pos = (
@@ -148,23 +128,69 @@ def build_robot_cfg(damping: float, robot_index: int) -> object:
         0.0,
         args_cli.base_height,
     )
-    cfg.actuators = {
-        "legs": AX18AActuatorCfg(
-            joint_names_expr=[".*HipYaw.*", ".*HipRoll.*", ".*Thigh.*", ".*Calf.*", ".*Ankle.*"],
-            stall_torque=args_cli.stall_torque,
-            effort_limit=args_cli.stall_torque * args_cli.torque_limit_ratio,
-            velocity_limit=args_cli.velocity_limit,
-            damping=damping,
-            armature=args_cli.armature,
-            friction=0.0,
-            coulomb_friction=args_cli.coulomb_friction,
-            viscous_friction_coeff=args_cli.viscous_friction,
-            compliance_margin=args_cli.compliance_margin * AX18A_RAD_PER_TICK,
-            compliance_slope=args_cli.compliance_slope,
-            punch=args_cli.punch,
-        )
-    }
+    if "legs" not in cfg.actuators:
+        raise KeyError("DextraAmpEnvCfg.robot must define a 'legs' actuator group")
+    cfg.actuators["legs"].damping = damping
     return cfg
+
+
+def optional_float(cfg: object, name: str) -> float | None:
+    """Return a scalar config field as float while preserving missing values."""
+    value = getattr(cfg, name, None)
+    return None if value is None else float(value)
+
+
+def actuator_effort_limit(actuator_cfg: object) -> float:
+    """Resolve the active simulation effort limit for implicit or explicit configs."""
+    value = getattr(actuator_cfg, "effort_limit_sim", None)
+    if value is None:
+        value = getattr(actuator_cfg, "effort_limit", None)
+    if value is None:
+        raise ValueError("AMP actuator config has no simulation effort limit")
+    return float(value)
+
+
+def actuator_config_snapshot(actuator_cfg: object) -> dict:
+    """Record the inherited actuator values needed to reproduce this run."""
+    class_type = getattr(actuator_cfg, "class_type", None)
+    snapshot = {
+        "config_class": type(actuator_cfg).__name__,
+        "actuator_class": getattr(class_type, "__name__", str(class_type)),
+        "joint_names_expr": list(getattr(actuator_cfg, "joint_names_expr", [])),
+        "damping_values_nms_per_rad": args_cli.damping_values,
+    }
+    for field in (
+        "stiffness",
+        "stall_torque",
+        "effort_limit",
+        "effort_limit_sim",
+        "velocity_limit",
+        "velocity_limit_sim",
+        "armature",
+        "friction",
+        "coulomb_friction",
+        "viscous_friction_coeff",
+        "compliance_margin",
+        "compliance_slope",
+        "punch",
+    ):
+        value = optional_float(actuator_cfg, field)
+        if value is not None:
+            snapshot[field] = value
+    return snapshot
+
+
+def use_amp_centered_damping_sweep(actuator_cfg: object) -> None:
+    """Build the default sweep around the active AMP actuator damping."""
+    if args_cli.damping_values is not None:
+        return
+    nominal_damping = optional_float(actuator_cfg, "damping")
+    if nominal_damping is None or nominal_damping <= 0.0:
+        raise ValueError("AMP actuator damping must be positive to construct the default sweep")
+    args_cli.damping_values = [
+        round(nominal_damping * multiplier, 6)
+        for multiplier in (0.5, 0.8, 1.0, 1.2, 1.5)
+    ]
 
 
 def build_command_schedule() -> tuple[list[dict], float]:
@@ -242,7 +268,13 @@ def compute_summary(records: dict[float, dict[str, list]], baseline_rad: float) 
     return summary
 
 
-def save_plot(output_dir: str, records: dict[float, dict[str, list]], segments: list[dict], effort_limit: float) -> None:
+def save_plot(
+    output_dir: str,
+    records: dict[float, dict[str, list]],
+    segments: list[dict],
+    effort_limit: float,
+    torque_limit_ratio: float,
+) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -282,7 +314,7 @@ def save_plot(output_dir: str, records: dict[float, dict[str, list]], segments: 
 
     fig.suptitle(
         f"Fixed-base AX-18A step response — {args_cli.joint_name}, ±{args_cli.step_deg:g}°, "
-        f"torque ratio={args_cli.torque_limit_ratio:g}",
+        f"torque ratio={torque_limit_ratio:g}",
         fontsize=14,
     )
     fig.savefig(os.path.join(output_dir, "step_response.png"), dpi=170)
@@ -325,20 +357,27 @@ def shutdown_simulation(exit_code: int) -> None:
 def main() -> None:
     global _active_sim
 
+    experiment_cfg = DextraAmpStepResponseCfg()
+    base_robot_cfg = experiment_cfg.robot
+    if "legs" not in base_robot_cfg.actuators:
+        raise KeyError("DextraAmpEnvCfg.robot must define a 'legs' actuator group")
+    base_actuator_cfg = base_robot_cfg.actuators["legs"]
+    use_amp_centered_damping_sweep(base_actuator_cfg)
     validate_args()
     output_dir = create_output_dir()
-    sim_dt = 1.0 / args_cli.physics_hz
-    effort_limit = args_cli.stall_torque * args_cli.torque_limit_ratio
 
-    sim_cfg = SimulationCfg(
-        dt=sim_dt,
-        render_interval=max(1, round(args_cli.physics_hz / 30.0)),
-        device=args_cli.device,
-        physx=PhysxCfg(
-            gpu_found_lost_pairs_capacity=2**23,
-            gpu_total_aggregate_pairs_capacity=2**23,
-        ),
+    sim_cfg = copy.deepcopy(experiment_cfg.sim)
+    sim_cfg.device = args_cli.device
+    sim_dt = float(sim_cfg.dt)
+    physics_hz = 1.0 / sim_dt
+    effort_limit = actuator_effort_limit(base_actuator_cfg)
+    stall_torque = optional_float(base_actuator_cfg, "stall_torque")
+    torque_limit_ratio = (
+        effort_limit / stall_torque
+        if stall_torque is not None and stall_torque > 0.0
+        else float(experiment_cfg.effort_limit_ratio)
     )
+
     sim = SimulationContext(sim_cfg)
     _active_sim = sim
     sim.set_camera_view(eye=[2.2, 2.0, 1.4], target=[0.0, 0.0, args_cli.base_height - 0.15])
@@ -350,7 +389,7 @@ def main() -> None:
 
     robots: list[Articulation] = []
     for robot_index, damping in enumerate(args_cli.damping_values):
-        robots.append(Articulation(build_robot_cfg(damping, robot_index)))
+        robots.append(Articulation(build_robot_cfg(base_robot_cfg, damping, robot_index)))
 
     sim.reset()
     joint_indices: list[int] = []
@@ -385,10 +424,12 @@ def main() -> None:
 
     print("\n[sysid-sim] Fixed-base AX-18A damping sweep")
     print(f"  Joint:              {args_cli.joint_name}")
+    print(f"  Config base:         {type(experiment_cfg).__name__} -> DextraAmpEnvCfg")
+    print(f"  Actuator model:      {type(base_actuator_cfg).__name__}")
     print(f"  Damping values:     {args_cli.damping_values}")
     print(f"  Command:            ±{args_cli.step_deg:g} deg from {args_cli.baseline_deg:g} deg")
-    print(f"  Torque limit:       {effort_limit:.4f} N m (ratio={args_cli.torque_limit_ratio:g})")
-    print(f"  Physics/log rate:   {args_cli.physics_hz:g} Hz")
+    print(f"  Torque limit:       {effort_limit:.4f} N m (ratio={torque_limit_ratio:g})")
+    print(f"  Physics/log rate:   {physics_hz:g} Hz (inherited)")
     print(f"  Duration:           {total_duration:.3f} s ({total_steps} steps)")
     print(f"  Output:             {output_dir}\n")
 
@@ -442,31 +483,25 @@ def main() -> None:
 
     config = {
         "joint_name": args_cli.joint_name,
+        "config_base": "DextraAmpEnvCfg",
+        "actuator_override_fields": ["damping"],
         "damping_values": args_cli.damping_values,
         "step_deg": args_cli.step_deg,
         "baseline_deg": args_cli.baseline_deg,
-        "physics_hz": args_cli.physics_hz,
+        "physics_hz": physics_hz,
+        "physics_dt_s": sim_dt,
+        "policy_decimation": experiment_cfg.decimation,
         "fixed_base": True,
         "base_height_m": args_cli.base_height,
         "domain_randomization": False,
         "segments": segments,
-        "actuator": {
-            "stall_torque_nm": args_cli.stall_torque,
-            "effort_limit_ratio": args_cli.torque_limit_ratio,
-            "effort_limit_nm": effort_limit,
-            "velocity_limit_rad_s": args_cli.velocity_limit,
-            "compliance_margin_register": args_cli.compliance_margin,
-            "compliance_slope_register": args_cli.compliance_slope,
-            "punch_register": args_cli.punch,
-            "armature_kgm2": args_cli.armature,
-            "coulomb_friction_nm": args_cli.coulomb_friction,
-            "viscous_friction_nms_per_rad": args_cli.viscous_friction,
-        },
+        "effort_limit_ratio": torque_limit_ratio,
+        "actuator": actuator_config_snapshot(base_actuator_cfg),
     }
     with open(os.path.join(output_dir, "config.json"), "w") as file:
         json.dump(config, file, indent=2)
 
-    save_plot(output_dir, records, segments, effort_limit)
+    save_plot(output_dir, records, segments, effort_limit, torque_limit_ratio)
     print("[sysid-sim] Done")
     print(f"  CSV:     {os.path.join(output_dir, 'responses.csv')}")
     print(f"  Plot:    {os.path.join(output_dir, 'step_response.png')}")
